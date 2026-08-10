@@ -1,0 +1,14 @@
+{
+  "name": "@ventostack/vm-runtime",
+  "version": "0.1.0",
+  "description": "N-API client for VentoAgentRuntime Firecracker sandboxes",
+  "license": "MIT",
+  "repository": "github:Ventorium/VentoAgentRuntime",
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "scripts": {"build": "napi build --platform --release ../../bindings/vm-napi", "test": "bun test"},
+  "devDependencies": {"@napi-rs/cli": "3.4.1"},
+  "napi": {"binaryName": "vento_vm_runtime", "triples": {"defaults": true}}
+}

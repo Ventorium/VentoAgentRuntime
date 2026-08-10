@@ -1,0 +1,22 @@
+{
+  "name": "@ventostack/document-runtime",
+  "version": "0.1.0",
+  "description": "Rust-native enterprise documents and media to LLM Markdown",
+  "license": "MIT",
+  "repository": "github:Ventorium/VentoAgentRuntime",
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "scripts": {
+    "build": "napi build --platform --release ../../bindings/document-napi",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.4.1"
+  },
+  "napi": {
+    "binaryName": "vento_document_runtime",
+    "triples": {"defaults": true}
+  }
+}

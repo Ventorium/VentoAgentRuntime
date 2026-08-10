@@ -1,0 +1,26 @@
+[package]
+name = "vento-pdf-engine"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+name = "vento_pdf_engine"
+
+[dependencies]
+env_logger.workspace = true
+log.workspace = true
+lopdf.workspace = true
+once_cell.workspace = true
+rayon.workspace = true
+regex.workspace = true
+ttf-parser.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+

@@ -1,0 +1,29 @@
+[package]
+name = "vento-document-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "vento_document_runtime"
+
+[dependencies]
+async-trait.workspace = true
+calamine.workspace = true
+cfb.workspace = true
+encoding_rs.workspace = true
+flate2.workspace = true
+log.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+vento-pdf-engine = { path = "../pdf-engine" }
+zip.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+

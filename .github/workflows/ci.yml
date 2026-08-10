@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      - run: cargo test --workspace
+      - name: Reject high-level conversion dependencies
+        run: '! cargo tree | grep -E "(^| )((anydoc|pdf-inspector|liteparse) )"'
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

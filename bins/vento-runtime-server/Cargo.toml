@@ -1,0 +1,19 @@
+[package]
+name = "vento-runtime-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+vento-firecracker-runtime = { path = "../../crates/firecracker-runtime" }
+vento-runtime-types = { path = "../../crates/runtime-types" }
+vento-vm-runtime = { path = "../../crates/vm-runtime" }
+
