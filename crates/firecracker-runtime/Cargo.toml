@@ -14,3 +14,5 @@ tokio.workspace = true
 vento-runtime-types = { path = "../runtime-types" }
 vento-vm-runtime = { path = "../vm-runtime" }
 
+[dev-dependencies]
+tempfile.workspace = true

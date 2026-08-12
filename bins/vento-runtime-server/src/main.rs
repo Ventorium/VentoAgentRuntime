@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -47,7 +48,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime: VmRuntime::new(factory),
         token: Arc::from(cli.token),
     };
-    let app = Router::new()
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+fn build_app(state: AppState) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/sandboxes", post(create_sandbox).get(list_sandboxes))
         .route("/sandboxes/{id}", get(get_sandbox).delete(destroy_sandbox))
@@ -67,12 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/sandboxes/{id}/snapshots", post(create_snapshot))
         .route("/snapshots/{id}", get(get_snapshot).delete(delete_snapshot))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .with_state(state)
 }
 
 async fn shutdown_signal() {
@@ -296,5 +302,159 @@ impl From<RuntimeError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(self.body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "vento-http-test-token-0001";
+
+    fn app() -> Router {
+        build_app(AppState {
+            runtime: VmRuntime::new(Arc::new(InMemoryBackendFactory)),
+            token: Arc::from(TOKEN),
+        })
+    }
+
+    fn request(method: &str, uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    async fn create(app: &Router, headers: &[(&str, &str)]) -> Value {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/sandboxes")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from("{}")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn authentication_is_required_for_control_plane_routes() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/sandboxes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_returns_the_same_sandbox() {
+        let app = app();
+        let first = create(&app, &[("idempotency-key", "same")]).await;
+        let second = create(&app, &[("idempotency-key", "same")]).await;
+        assert_eq!(first["sandboxId"], second["sandboxId"]);
+    }
+
+    #[tokio::test]
+    async fn traversal_and_knowledge_writes_return_bad_request() {
+        let app = app();
+        let sandbox = create(&app, &[]).await;
+        for path in [
+            "%2Fworkspace%2F..%2Fetc%2Fpasswd",
+            "%2Fknowledge%2Fpoison.md",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "PUT",
+                    &format!(
+                        "/sandboxes/{}/files/content?path={path}",
+                        sandbox["sandboxId"].as_str().unwrap()
+                    ),
+                    Body::from("x"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_sandbox_pause_and_snapshot_return_conflict_without_leaking_secret() {
+        let app = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/sandboxes",
+                Body::from(r#"{"secrets":{"TOKEN":"super-secret-value"}}"#),
+            ))
+            .await
+            .unwrap();
+        let sandbox: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        for suffix in ["pause", "snapshots"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    &format!(
+                        "/sandboxes/{}/{suffix}",
+                        sandbox["sandboxId"].as_str().unwrap()
+                    ),
+                    Body::from("{}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(!body.contains("super-secret-value"));
+        }
+    }
+
+    #[tokio::test]
+    async fn command_validation_maps_to_stable_error_code() {
+        let app = app();
+        let sandbox = create(&app, &[]).await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/sandboxes/{}/commands",
+                    sandbox["sandboxId"].as_str().unwrap()
+                ),
+                Body::from(r#"{"command":[]}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(error["code"], "INVALID_INPUT");
     }
 }

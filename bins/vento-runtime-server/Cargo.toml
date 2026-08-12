@@ -17,3 +17,5 @@ vento-firecracker-runtime = { path = "../../crates/firecracker-runtime" }
 vento-runtime-types = { path = "../../crates/runtime-types" }
 vento-vm-runtime = { path = "../../crates/vm-runtime" }
 
+[dev-dependencies]
+tower = "=0.5.3"

@@ -101,6 +101,7 @@ pub struct VmRuntime {
     sandboxes: Arc<RwLock<HashMap<SandboxId, SharedSandbox>>>,
     snapshots: Arc<RwLock<HashMap<SnapshotId, SnapshotInfo>>>,
     idempotency: Arc<Mutex<HashMap<String, SandboxId>>>,
+    create_guard: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for VmRuntime {
@@ -116,6 +117,7 @@ impl VmRuntime {
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             idempotency: Arc::new(Mutex::new(HashMap::new())),
+            create_guard: Arc::new(Mutex::new(())),
         }
     }
 
@@ -133,6 +135,10 @@ impl VmRuntime {
                 "timeoutSeconds must be 1..=86400".into(),
             ));
         }
+        let idempotency_key = idempotency_key.filter(|key| !key.trim().is_empty());
+        // Serialize the lookup + backend creation + insertion transaction. This
+        // makes concurrent retries with the same key observe one sandbox.
+        let _create_guard = self.create_guard.lock().await;
         if let Some(key) = idempotency_key
             && let Some(existing) = self.idempotency.lock().await.get(key).cloned()
         {
@@ -178,7 +184,7 @@ impl VmRuntime {
             .write()
             .await
             .insert(sandbox_id.clone(), record);
-        if let (Some(key), true) = (idempotency_key, !key_is_blank(idempotency_key)) {
+        if let Some(key) = idempotency_key {
             self.idempotency
                 .lock()
                 .await
@@ -490,9 +496,6 @@ fn touch(info: &mut SandboxInfo, timeout_seconds: u64) {
     let timestamp = now_ms();
     info.last_active_at_ms = timestamp;
     info.expires_at_ms = timestamp.saturating_add(timeout_seconds.saturating_mul(1_000));
-}
-fn key_is_blank(value: Option<&str>) -> bool {
-    value.is_none_or(|value| value.trim().is_empty())
 }
 
 #[derive(Clone, Debug, Default)]

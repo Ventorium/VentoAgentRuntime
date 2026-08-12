@@ -33,6 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn prepare_directories() -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("VENTO_AGENTD_SKIP_PREPARE").is_some() {
+        return Ok(());
+    }
     for path in ["/workspace", "/knowledge", "/tmp", "/home"] {
         tokio::fs::create_dir_all(path).await?;
     }
@@ -122,6 +126,9 @@ async fn run(request: vento_runtime_types::CommandRequest) -> AgentResponse {
     }
     let started = Instant::now();
     let mut command = tokio::process::Command::new(&request.command[0]);
+    if request.stdin.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
     command
         .args(&request.command[1..])
         .current_dir(request.cwd)
@@ -132,9 +139,18 @@ async fn run(request: vento_runtime_types::CommandRequest) -> AgentResponse {
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    let input = request.stdin;
     let outcome = tokio::time::timeout(
         std::time::Duration::from_millis(request.timeout_ms),
-        command.output(),
+        async {
+            let mut child = command.spawn()?;
+            if let Some(input) = input
+                && let Some(mut stdin) = child.stdin.take()
+            {
+                stdin.write_all(&input).await?;
+            }
+            child.wait_with_output().await
+        },
     )
     .await;
     let (exit_code, stdout, stderr, timed_out) = match outcome {

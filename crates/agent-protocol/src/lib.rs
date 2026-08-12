@@ -83,4 +83,29 @@ mod tests {
         assert!(validate_guest_path("/knowledge/a.md", false).is_ok());
         assert!(validate_guest_path("/knowledge/a.md", true).is_err());
     }
+
+    #[test]
+    fn path_policy_rejects_traversal_nul_relative_and_system_paths() {
+        for path in [
+            "workspace/a",
+            "/workspace/../etc/passwd",
+            "/etc/passwd",
+            "/workspace/a\0b",
+        ] {
+            assert!(
+                validate_guest_path(path, false).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_and_tmp_are_writable_but_roots_are_scoped() {
+        for path in ["/workspace", "/workspace/a/b", "/tmp", "/tmp/output"] {
+            assert!(validate_guest_path(path, true).is_ok(), "rejected {path}");
+        }
+        for path in ["/", "/home", "/proc", "/knowledge", "/knowledge/a"] {
+            assert!(validate_guest_path(path, true).is_err(), "accepted {path}");
+        }
+    }
 }

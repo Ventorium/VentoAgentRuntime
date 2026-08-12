@@ -139,10 +139,19 @@ impl SandboxBackend for FirecrackerBackend {
             return Ok(());
         }
         self.spawn().await?;
-        if let Some(snapshot) = self.paused_snapshot.clone() {
-            self.load_snapshot(&snapshot).await?;
+        let start_result = if let Some(snapshot) = self.paused_snapshot.clone() {
+            self.load_snapshot(&snapshot).await
         } else {
-            self.configure_fresh().await?;
+            self.configure_fresh().await
+        };
+        if let Err(error) = start_result {
+            if let Err(cleanup_error) = self.terminate().await {
+                return Err(RuntimeError::Backend(format!(
+                    "{error}; additionally failed to terminate Firecracker: {cleanup_error}"
+                )));
+            }
+            let _ = tokio::fs::remove_dir_all(&self.sandbox_dir).await;
+            return Err(error);
         }
         self.running = true;
         Ok(())
@@ -424,7 +433,7 @@ async fn reflink_clone(source: &Path, destination: &Path) -> Result<(), RuntimeE
     let _ = tokio::fs::remove_file(destination).await;
     let output = Command::new("cp")
         .arg("--reflink=always")
-        .arg("--sparse=always")
+        .arg("--sparse=auto")
         .arg("--")
         .arg(source)
         .arg(destination)
@@ -474,5 +483,36 @@ mod tests {
     #[test]
     fn guest_cid_is_not_reserved() {
         assert!(guest_cid(Path::new("sandbox")) >= 3);
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_missing_runtime_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = FirecrackerFactory::new(FirecrackerConfig {
+            firecracker_binary: temp.path().join("missing-firecracker"),
+            jailer_binary: None,
+            kernel_image: temp.path().join("missing-kernel"),
+            base_rootfs: temp.path().join("missing-rootfs"),
+            data_dir: temp.path().join("data"),
+            agent_vsock_port: default_agent_port(),
+            boot_timeout_ms: default_boot_timeout(),
+        });
+        let error = factory.preflight().await.unwrap_err();
+        let message = error.to_string();
+        if cfg!(target_os = "linux") {
+            assert!(message.contains("firecracker does not exist"));
+        } else {
+            assert!(message.contains("requires Linux"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Linux, KVM, Firecracker, guest kernel/rootfs and XFS/Btrfs; run via tests/sandbox/run-host-acceptance.sh"]
+    async fn real_host_preflight_accepts_provisioned_environment() {
+        let config_path =
+            std::env::var("VENTO_FIRECRACKER_CONFIG").expect("VENTO_FIRECRACKER_CONFIG");
+        let config: FirecrackerConfig =
+            serde_json::from_slice(&tokio::fs::read(config_path).await.unwrap()).unwrap();
+        FirecrackerFactory::new(config).preflight().await.unwrap();
     }
 }
