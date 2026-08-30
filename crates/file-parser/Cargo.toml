@@ -1,0 +1,36 @@
+[package]
+name = "vento-file-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "vento_file_parser"
+
+[dependencies]
+# anydoc 上游原依赖
+cfb.workspace = true
+csv = "=1.4.0"
+encoding_rs.workspace = true
+flate2.workspace = true
+log.workspace = true
+quick-xml.workspace = true
+zip.workspace = true
+
+# pdf-inspector 作为本地依赖（原 anydoc 通过 crates.io 依赖它；我们改为内树）
+vento-pdf-engine = { path = "../pdf-engine" }
+
+# 我们自己的薄壳 + 远程 OCR
+async-trait.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2.0"
+tokio.workspace = true
+
+[dev-dependencies]
+insta = "1"
+sha2 = "0.10"

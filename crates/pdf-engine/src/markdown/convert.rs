@@ -11,9 +11,7 @@ use super::analysis::{
     detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment, is_toc_entry_line,
     is_toc_marker_heading,
 };
-use super::classify::{
-    format_list_item, is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,
-};
+use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
 use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
@@ -698,6 +696,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let base_size = options
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
+    let base_size = super::analysis::correct_base_size(&lines, base_size);
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
@@ -771,7 +770,27 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    // Code lines accumulate here and the fence is emitted only when the
+    // block flushes with content — an empty ``` ``` pair can never appear.
+    fn flush_code_block(output: &mut String, pending_code: &mut String) {
+        let trimmed = pending_code.trim();
+        // A fragment too short to be code — a lone ® or stray glyph set in
+        // a mono face — reads better as plain text than as a fenced block.
+        if trimmed.chars().count() < 3 {
+            if !trimmed.is_empty() {
+                output.push_str(trimmed);
+                output.push_str("\n\n");
+            }
+        } else {
+            output.push_str("```\n");
+            output.push_str(pending_code);
+            output.push_str("```\n");
+        }
+        pending_code.clear();
+    }
+
     let mut in_code_block = false;
+    let mut pending_code = String::new();
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
     let mut toc_suppress_page: Option<u32> = None;
@@ -805,7 +824,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             // Flush current page's remaining tables and images
             if current_page > 0 {
                 if in_code_block {
-                    output.push_str("```\n");
+                    flush_code_block(&mut output, &mut pending_code);
                     in_code_block = false;
                 }
                 flush_page_tables_and_images(
@@ -867,6 +886,14 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
                 };
                 if positioned_block_precedes_line(block, line) && !already_inserted {
+                    // Code lines buffer until their block closes; flush them
+                    // first so this block cannot jump ahead of code that
+                    // precedes it in reading order. A code line after the
+                    // block reopens a new fence naturally.
+                    if in_code_block {
+                        flush_code_block(&mut output, &mut pending_code);
+                        in_code_block = false;
+                    }
                     if in_paragraph {
                         output.push_str("\n\n");
                         in_paragraph = false;
@@ -937,15 +964,22 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // These should be on their own line followed by a paragraph break
         let struct_role = struct_roles.and_then(|roles| resolve_line_struct_role(line, roles));
 
-        // Determine if this line is code (struct-tree or font-based) for block accumulation
+        // Determine if this line is code (struct-tree or font-based) for
+        // block accumulation. Font-based detection only opens a block at a
+        // paragraph boundary: a mono-set line that continues an open prose
+        // paragraph is the producer smearing an inline code literal's style
+        // across a wrapped line (HTML-to-PDF exports do this), and fencing
+        // it would cut the sentence in three.
         let is_code_line = struct_role
             .as_ref()
             .is_some_and(|r| matches!(r, StructRole::Code))
-            || (options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)));
+            || (options.detect_code
+                && (in_code_block || !in_paragraph)
+                && super::classify::line_is_monospace(line));
 
         // Close code block when transitioning to non-code
         if in_code_block && !is_code_line {
-            output.push_str("```\n");
+            flush_code_block(&mut output, &mut pending_code);
             in_code_block = false;
         }
 
@@ -1179,12 +1213,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 in_paragraph = false;
                 paragraph_in_wrapped_bold_run = false;
             }
-            if !in_code_block {
-                output.push_str("```\n");
-                in_code_block = true;
-            }
-            output.push_str(plain_trimmed);
-            output.push('\n');
+            in_code_block = true;
+            pending_code.push_str(plain_trimmed);
+            pending_code.push('\n');
             continue;
         }
 
@@ -1209,7 +1240,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
     // Close any trailing code block
     if in_code_block {
-        output.push_str("```\n");
+        flush_code_block(&mut output, &mut pending_code);
     }
 
     // Flush current page and any remaining pages with tables/images
@@ -1256,6 +1287,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let base_size = options
         .base_font_size
         .unwrap_or(font_stats.most_common_size);
+    let base_size = super::analysis::correct_base_size(&lines, base_size);
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
@@ -1370,7 +1402,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             && !is_toc_entry_line(plain_trimmed)
             && !is_heading_fragment(plain_trimmed)
             && toc_suppress_page != Some(line.page)
-            && !(options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)))
+            && !(options.detect_code && super::classify::line_is_monospace(line))
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) = detect_header_level(
@@ -1471,19 +1503,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
 
-        // Detect code blocks by font
-        if options.detect_code {
-            let is_mono = line.items.iter().any(|i| is_monospace_font(&i.font));
-            if is_mono {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
-                    paragraph_in_wrapped_bold_run = false;
-                }
-                // Use plain text for code blocks
-                output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
-                continue;
-            }
+        // Detect code blocks by font. Only at a paragraph boundary — a
+        // mono-set line continuing an open prose paragraph is an inline
+        // code literal's style smeared across a wrapped line, not code.
+        if options.detect_code && !in_paragraph && super::classify::line_is_monospace(line) {
+            // Use plain text for code blocks
+            output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
+            continue;
         }
 
         // Regular text - join lines within same paragraph with space
@@ -1543,6 +1569,7 @@ mod tests {
             width: 100.0,
             height: 12.0,
             font: "Helvetica".to_string(),
+            font_tag: String::new(),
             font_size: 12.0,
             page,
             is_bold: false,
@@ -1829,7 +1856,7 @@ mod tests {
 
     #[test]
     fn test_struct_role_heading_levels() {
-        let mcids = vec![
+        let mcids = [
             (StructRole::H1, "Title"),
             (StructRole::H2, "Section"),
             (StructRole::H3, "Subsection"),
@@ -2147,10 +2174,9 @@ mod tests {
         // 5 tagged P.
         let mut lines = Vec::new();
         let mut page_roles = HashMap::new();
-        let mut mcid = 0i64;
 
-        for i in 0..30 {
-            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid));
+        for (mcid, i) in (0..30).enumerate() {
+            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid as i64));
             item.y = 700.0 - (i as f32 * 15.0);
             lines.push(make_line(vec![item]));
 
@@ -2161,8 +2187,7 @@ mod tests {
             } else {
                 StructRole::P
             };
-            page_roles.insert(mcid, role);
-            mcid += 1;
+            page_roles.insert(mcid as i64, role);
         }
 
         let mut roles = HashMap::new();
@@ -2188,10 +2213,9 @@ mod tests {
         // Normal document: a few headings, mostly body text
         let mut lines = Vec::new();
         let mut page_roles = HashMap::new();
-        let mut mcid = 0i64;
 
-        for i in 0..50 {
-            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid));
+        for (mcid, i) in (0..50).enumerate() {
+            let mut item = make_item(&format!("Line {i}"), 1, Some(mcid as i64));
             item.y = 700.0 - (i as f32 * 14.0);
             lines.push(make_line(vec![item]));
 
@@ -2200,8 +2224,7 @@ mod tests {
             } else {
                 StructRole::P
             };
-            page_roles.insert(mcid, role);
-            mcid += 1;
+            page_roles.insert(mcid as i64, role);
         }
 
         let mut roles = HashMap::new();

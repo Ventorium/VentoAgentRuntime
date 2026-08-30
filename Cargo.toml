@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
+exclude = [".repos"]
 members = [
   "crates/runtime-types",
   "crates/pdf-engine",
-  "crates/document-runtime",
-  "crates/document-providers",
+  "crates/file-parser",
   "crates/agent-protocol",
   "crates/vm-runtime",
   "crates/firecracker-runtime",
-  "bindings/document-napi",
+  "bindings/file-napi",
   "bindings/vm-napi",
   "bins/vento-runtime-server",
   "bins/vento-runtime-cli",

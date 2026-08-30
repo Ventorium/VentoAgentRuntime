@@ -15,6 +15,7 @@ lopdf.workspace = true
 once_cell.workspace = true
 rayon.workspace = true
 regex.workspace = true
+thiserror = "=2.0"
 ttf-parser.workspace = true
 unicode-normalization.workspace = true
 
@@ -23,4 +24,8 @@ tempfile.workspace = true
 
 [features]
 default = []
-
+# Reserved upstream feature flag. The vision OCR backend was excluded from this
+# port (OCR is delegated to the remote provider in vento-file-parser), but the
+# `#[cfg(feature = "ocr")]` plumbing is kept so the crate stays diff-clean
+# against upstream. Enabling this flag does not restore OCR.
+ocr = []

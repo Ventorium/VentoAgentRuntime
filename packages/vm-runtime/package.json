@@ -7,8 +7,26 @@
   "type": "commonjs",
   "main": "index.js",
   "types": "index.d.ts",
-  "files": ["index.js", "index.d.ts", "*.node"],
-  "scripts": {"build": "napi build --platform --release ../../bindings/vm-napi", "test": "bun test"},
+  "files": ["index.js", "index.d.ts"],
+  "publishConfig": {"access": "public"},
+  "scripts": {
+    "build": "napi build --platform --release ../../bindings/vm-napi",
+    "artifacts": "napi artifacts",
+    "create-npm-dirs": "napi create-npm-dirs",
+    "prepublishOnly": "napi prepublish -t npm --no-gh-release",
+    "test": "bun test"
+  },
   "devDependencies": {"@napi-rs/cli": "3.4.1"},
-  "napi": {"binaryName": "vento_vm_runtime", "triples": {"defaults": true}}
+  "napi": {
+    "binaryName": "vento_vm_runtime",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl"
+    ]
+  }
 }

@@ -517,6 +517,7 @@ mod tests {
             width: text.len() as f32 * font_size * 0.5,
             height: font_size,
             font: "TestFont".to_string(),
+            font_tag: String::new(),
             font_size,
             page: 1,
             is_bold: false,
@@ -604,7 +605,7 @@ mod tests {
         let items: Vec<(usize, &TextItem)> = vec![];
         assert_eq!(
             find_column_boundaries(&items, TableDetectionMode::SmallFont),
-            vec![]
+            Vec::<f32>::new()
         );
     }
 
@@ -661,12 +662,12 @@ mod tests {
     #[test]
     fn test_find_row_boundaries_empty() {
         let items: Vec<(usize, &TextItem)> = vec![];
-        assert_eq!(find_row_boundaries(&items), vec![]);
+        assert_eq!(find_row_boundaries(&items), Vec::<f32>::new());
     }
 
     #[test]
     fn test_find_row_boundaries_descending_order() {
-        let items_data = vec![
+        let items_data = [
             make_item("A", 100.0, 500.0, 10.0),
             make_item("B", 100.0, 480.0, 10.0),
             make_item("C", 100.0, 460.0, 10.0),
@@ -682,7 +683,7 @@ mod tests {
     #[test]
     fn test_find_row_boundaries_clustering() {
         // Items close together should cluster into one row
-        let items_data = vec![
+        let items_data = [
             make_item("A", 100.0, 500.0, 10.0),
             make_item("B", 200.0, 501.0, 10.0),
             make_item("C", 100.0, 480.0, 10.0),
@@ -694,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_find_row_boundaries_single_row() {
-        let items_data = vec![make_item("A", 100.0, 500.0, 10.0)];
+        let items_data = [make_item("A", 100.0, 500.0, 10.0)];
         let items: Vec<(usize, &TextItem)> = items_data.iter().enumerate().collect();
         let rows = find_row_boundaries(&items);
         assert_eq!(rows.len(), 1);
@@ -703,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_find_row_boundaries_items_at_same_y() {
-        let items_data = vec![
+        let items_data = [
             make_item("A", 100.0, 500.0, 10.0),
             make_item("B", 200.0, 500.0, 10.0),
             make_item("C", 300.0, 500.0, 10.0),
@@ -910,6 +911,7 @@ mod tests {
                         font_size: 7.0,
                         height: 7.0,
                         font: String::new(),
+                        font_tag: String::new(),
                         is_bold: false,
                         is_italic: false,
                         is_underline: false,
@@ -948,6 +950,7 @@ mod tests {
                         font_size: 10.0,
                         height: 7.0,
                         font: String::new(),
+                        font_tag: String::new(),
                         is_bold: false,
                         is_italic: false,
                         is_underline: false,

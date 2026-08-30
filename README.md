@@ -1,14 +1,17 @@
 # VentoAgentRuntime
 
-Rust-native document ingestion and Firecracker sandbox runtime for AI agents.
+Rust-native document parsing and Firecracker sandbox runtime for AI agents.
 
 ## Packages
 
-- `@ventostack/document-runtime`: files, URLs and media to LLM-oriented Markdown.
+- `@ventostack/file-parser`: any file to LLM-oriented Markdown (Office, PDF, images via remote OCR, plain text).
 - `@ventostack/vm-runtime`: E2B-shaped client for the sandbox runtime.
 
-The document implementation owns its Office and PDF parsing code. It does not depend on
-`anydoc`, `pdf-inspector` or `liteparse`.
+The document implementation lives in `crates/file-parser` (Office/OpenDocument/RTF/EPUB/CSV
+parsers and the Markdown renderer, derived from `anydoc`) and `crates/pdf-engine` (PDF text
+and table extraction, derived from `pdf-inspector`). Both are maintained in-tree; upstream
+references are kept under `.repos/` and neither is an external dependency (see `NOTICE.md`).
+Scanned PDFs and standalone images route through a configurable remote PaddleOCR provider.
 
 ## Development
 

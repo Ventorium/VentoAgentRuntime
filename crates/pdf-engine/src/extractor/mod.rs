@@ -3,13 +3,14 @@
 //! This module extracts text with position information for structure detection.
 
 mod base14;
+mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
 mod layout;
 mod links;
 mod reading_order;
 pub(crate) mod underline;
-mod xobjects;
+pub(crate) mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
@@ -37,6 +38,7 @@ pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_re
 pub(crate) use layout::is_newspaper_layout;
 pub(crate) use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
+pub(crate) use xobjects::FormWalkBudget;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -282,18 +284,22 @@ fn extract_positioned_text_impl(
             font_cmaps,
             include_invisible,
             &mut style_cache,
+            &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated) = match page_result {
-            Ok(extraction) => extraction,
-            Err(error) if required_pages.is_some_and(|required| !required.contains(page_num)) => {
-                debug!(
-                    "page {}: skipping context-only extraction error: {}",
-                    page_num, error
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
+            match page_result {
+                Ok(extraction) => extraction,
+                Err(error)
+                    if required_pages.is_some_and(|required| !required.contains(page_num)) =>
+                {
+                    debug!(
+                        "page {}: skipping context-only extraction error: {}",
+                        page_num, error
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
@@ -884,6 +890,92 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     Some((end, floor * fs))
 }
 
+/// Fractional font-size band within which `merge_text_items` treats two runs as
+/// the same size. Shared with `is_small_caps_continuation`, which exists only to
+/// rescue junctions this band would otherwise break.
+const MERGE_FONT_SIZE_BAND: f32 = 0.20;
+
+/// Detect a small-caps continuation: typesetters render small caps as a
+/// full-size capital immediately followed by shrunken capitals in the same
+/// font (`(R) Tj` at 9.98pt, then `(OLANDO) Tj` at 6.74pt). Those runs are one
+/// word, but the font-size band in `merge_text_items` would split them,
+/// leaving "R" and "OLANDO" as separate items — which then read as separate
+/// table columns, since column boundaries cluster on item start positions.
+///
+/// Gated tightly so it cannot absorb the other reasons a smaller run follows a
+/// larger one:
+///   - runs the size band already accepts — excluded by requiring the junction
+///     to *cross* the band, so within-band pairs keep the normal word-spacing
+///     logic instead of having their space suppressed
+///   - superscripts / footnote markers — excluded by requiring an uppercase
+///     *letter* on both sides, so digits never qualify
+///   - drop caps — excluded because the body text that follows is mixed case
+///   - adjacent table cells or separate words — excluded by requiring the runs
+///     to be visually contiguous (essentially no gap)
+fn is_small_caps_continuation(
+    text_so_far: &str,
+    first: &TextItem,
+    next: &TextItem,
+    gap: f32,
+) -> bool {
+    // Must shrink. Real small caps sit near 0.7-0.8 of the full cap height;
+    // anything smaller is a superscript or a different run entirely.
+    if first.font_size <= 0.0 || next.font_size >= first.font_size {
+        return false;
+    }
+    // Only rescue junctions the size band would have broken. Within-band pairs
+    // merge on their own, and suppressing their space would swallow real word
+    // gaps between two similarly-sized uppercase words.
+    if (next.font_size - first.font_size).abs() <= first.font_size * MERGE_FONT_SIZE_BAND {
+        return false;
+    }
+    if next.font_size / first.font_size < 0.55 {
+        return false;
+    }
+    // Visually contiguous: the capital and its small caps touch. A real word
+    // space or a column gap disqualifies.
+    if !(-first.font_size * 0.2..=first.font_size * 0.15).contains(&gap) {
+        return false;
+    }
+    // The continuation must be all-uppercase letters (digits and lowercase
+    // both disqualify), and must contain at least one letter.
+    let mut saw_letter = false;
+    for ch in next.text.chars() {
+        if ch.is_alphabetic() {
+            saw_letter = true;
+            if !ch.is_uppercase() {
+                return false;
+            }
+        } else if ch.is_numeric() {
+            return false;
+        }
+    }
+    if !saw_letter {
+        return false;
+    }
+    // What we are continuing must itself end in a capital. Check the actual
+    // trailing character rather than skipping back to the nearest letter: after
+    // "ANGELA M. MAZZARELLI1" the run to continue is the footnote marker, not
+    // the "I" before it.
+    let trimmed = text_so_far.trim_end();
+    if trimmed.chars().last().is_some_and(|c| c.is_numeric()) {
+        // One legitimate exception: an ordinal suffix set as a smaller run,
+        // e.g. "JULY 4" + "TH". Only the four English suffixes qualify —
+        // anything else after a digit is a footnote marker or numeric suffix.
+        return matches!(trimmed_suffix(next), "TH" | "ST" | "ND" | "RD");
+    }
+    trimmed
+        .chars()
+        .rev()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_uppercase())
+}
+
+/// The continuation run's text, trimmed — used to spot ordinal suffixes.
+fn trimmed_suffix(next: &TextItem) -> &str {
+    next.text.trim()
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -913,6 +1005,10 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
             group.sort_by(|a, b| b.x.total_cmp(&a.x));
+            // Embedded LTR phrases must recover screen order before merging
+            // bakes the concatenation in — later sort_line_items passes can
+            // no longer separate a merged item.
+            crate::text_utils::restore_embedded_ltr_runs(&mut group, |i| i.text.as_str());
         } else if !preserve_stream_order {
             group.sort_by(|a, b| a.x.total_cmp(&b.x));
         }
@@ -942,8 +1038,16 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let mut j = i + 1;
             while j < group.len() {
                 let next = group[j];
-                // Must be similar font size (within 20%)
-                if (next.font_size - first.font_size).abs() > first.font_size * 0.20 {
+                // A small-caps junction is mid-word: it both survives the
+                // font-size band below and must never take a space.
+                let small_caps_join =
+                    is_small_caps_continuation(&text, first, next, next.x - end_x);
+                // Must be similar font size, except for genuine small-caps
+                // runs, where the shrunken capitals are the same word as the
+                // full-size initial (see helper).
+                if (next.font_size - first.font_size).abs() > first.font_size * MERGE_FONT_SIZE_BAND
+                    && !small_caps_join
+                {
                     break;
                 }
                 // Never merge across style boundaries: the merged item
@@ -997,7 +1101,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
-                if needs_bullet_space || gap > effective_threshold {
+                if !small_caps_join && (needs_bullet_space || gap > effective_threshold) {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
@@ -1017,6 +1121,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 width: end_x - first.x,
                 height: first.height,
                 font: first.font.clone(),
+                font_tag: first.font_tag.clone(),
                 font_size: first.font_size,
                 page: first.page,
                 is_bold: first.is_bold,
@@ -1238,11 +1343,11 @@ mod tests {
         // break): the split must land between the modes. Needs >=4 gaps to
         // enter the bimodal tier — short runs use the strict uniform gate.
         let mut items = glyph_run("ITISOK", 100.0, 8.0, 2.3);
-        for i in 2..6 {
-            items[i].x += 2.8; // word gap at T|I
+        for item in &mut items[2..6] {
+            item.x += 2.8; // word gap at T|I
         }
-        for i in 4..6 {
-            items[i].x += 2.8; // word gap at S|O
+        for item in &mut items[4..6] {
+            item.x += 2.8; // word gap at S|O
         }
         let merged = merge_text_items(items);
         assert_eq!(merged.len(), 1);
@@ -1320,6 +1425,7 @@ mod tests {
             width,
             height: 12.0,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size: 12.0,
             page: 1,
             is_bold: false,
@@ -1578,6 +1684,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -1594,6 +1701,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -1610,6 +1718,7 @@ mod tests {
                 width: 80.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2396,6 +2505,7 @@ mod tests {
                 width: 19.5,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2412,6 +2522,7 @@ mod tests {
                 width: 42.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2428,6 +2539,7 @@ mod tests {
                 width: 35.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2455,6 +2567,7 @@ mod tests {
                 width: 8.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2471,6 +2584,7 @@ mod tests {
                 width: 8.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2487,6 +2601,7 @@ mod tests {
                 width: 8.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2516,6 +2631,7 @@ mod tests {
                 width,
                 height: 13.3,
                 font: "F4".into(),
+                font_tag: String::new(),
                 font_size: 13.3,
                 page: 1,
                 is_bold: true,
@@ -2552,6 +2668,7 @@ mod tests {
                 width,
                 height: 13.3,
                 font: "F5".into(),
+                font_tag: String::new(),
                 font_size: 13.3,
                 page: 1,
                 is_bold: false,
@@ -2589,6 +2706,7 @@ mod tests {
                 width: 24.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2605,6 +2723,7 @@ mod tests {
                 width: 32.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2621,6 +2740,7 @@ mod tests {
                 width: 32.0,
                 height: 12.0,
                 font: "C2_0".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2645,6 +2765,7 @@ mod tests {
             width,
             height: 12.0,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size: 12.0,
             page: 1,
             is_bold: false,
@@ -2750,6 +2871,31 @@ mod tests {
     }
 
     #[test]
+    fn test_is_rtl_text_weak_chars_do_not_vote() {
+        // Arabic-Indic digits (U+0660-0669) are bidi class AN, not strong RTL:
+        // a digits-only line must stay neutral, like ASCII-digit lines.
+        assert!(!is_rtl_text(["\u{0661}\u{0662}\u{0663}"].iter()));
+        // Extended Arabic-Indic digits (U+06F0-06F9) likewise
+        assert!(!is_rtl_text(["\u{06F1}\u{06F2}\u{06F3}"].iter()));
+        // Arabic decimal/thousands separators (U+066B/U+066C) with digits
+        assert!(!is_rtl_text(
+            ["\u{0661}\u{066B}\u{0662}\u{0663}\u{066C}\u{0664}"].iter()
+        ));
+        // Arabic letters alongside Arabic-Indic digits → still RTL
+        assert!(is_rtl_text(
+            ["\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \u{0661}\u{0662}"].iter()
+        ));
+        // Arabic letters with combining marks (NSM) → still RTL
+        assert!(is_rtl_text(["\u{0645}\u{064E}\u{0631}\u{064D}"].iter()));
+        // Combining marks alone are NSM, not strong RTL, even though they are
+        // Other_Alphabetic: harakat-only and niqqud-only lines stay neutral
+        assert!(!is_rtl_text(["\u{064E}\u{064F}\u{0650}\u{0651}"].iter()));
+        assert!(!is_rtl_text(["\u{05B8}\u{05B4}\u{05BC}"].iter()));
+        // Marks + Arabic-Indic digits (the full weak-only mix) → still neutral
+        assert!(!is_rtl_text(["\u{0661}\u{064E}\u{0662}"].iter()));
+    }
+
+    #[test]
     fn test_rtl_line_sorting() {
         let mut items = vec![
             TextItem {
@@ -2759,6 +2905,7 @@ mod tests {
                 width: 10.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2775,6 +2922,7 @@ mod tests {
                 width: 10.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2801,6 +2949,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2817,6 +2966,7 @@ mod tests {
                 width: 50.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page: 1,
                 is_bold: false,
@@ -2859,6 +3009,7 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -2905,6 +3056,7 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -2951,6 +3103,7 @@ mod tests {
                 width: 100.0,
                 height: 12.0,
                 font: "F1".into(),
+                font_tag: String::new(),
                 font_size: 12.0,
                 page,
                 is_bold: false,
@@ -2990,6 +3143,7 @@ mod tests {
             width,
             height: font_size,
             font: "F1".into(),
+            font_tag: String::new(),
             font_size,
             page: 1,
             is_bold: false,
@@ -2999,6 +3153,145 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    /// Small caps as typesetters emit them: a full-size capital at 9.98pt
+    /// immediately followed by shrunken capitals at 6.74pt, touching.
+    /// Modelled on `199AD3d.pdf` p.5 ("ROLANDO T. ACOSTA, P.J.").
+    #[test]
+    fn small_caps_run_merges_into_one_word() {
+        let items = vec![
+            make_item_fs("R", 144.36, 581.84, 7.20, 9.98),
+            make_item_fs("OLANDO", 151.56, 581.84, 30.56, 6.74),
+            make_item_fs("T. A", 185.45, 581.84, 17.58, 9.98),
+            make_item_fs("COSTA", 203.94, 581.84, 23.15, 6.74),
+            make_item_fs(", P.J.", 227.09, 581.84, 22.56, 9.98),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "got {:?}", merged);
+        assert_eq!(merged[0].text, "ROLANDO T. ACOSTA, P.J.");
+    }
+
+    /// The full two-column row: both names must merge independently and the
+    /// 72pt column gap between them must survive as an item boundary.
+    #[test]
+    fn small_caps_merge_does_not_swallow_a_second_column() {
+        let items = vec![
+            // Column 1: "ROLANDO T. ACOSTA, P.J." ending at x=249.65
+            make_item_fs("R", 144.36, 581.84, 7.20, 9.98),
+            make_item_fs("OLANDO", 151.56, 581.84, 30.56, 6.74),
+            make_item_fs("T. A", 185.45, 581.84, 17.58, 9.98),
+            make_item_fs("COSTA", 203.94, 581.84, 23.15, 6.74),
+            make_item_fs(", P.J.", 227.09, 581.84, 22.56, 9.98),
+            // Column 2 starts at x=321.96 — a 72pt gap.
+            make_item_fs("A", 321.96, 581.84, 7.20, 9.98),
+            make_item_fs("NIL", 329.17, 581.84, 12.72, 6.74),
+            make_item_fs("C. S", 345.04, 581.84, 19.59, 9.98),
+            make_item_fs("INGH", 364.62, 581.84, 19.08, 6.74),
+        ];
+        let merged = merge_text_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["ROLANDO T. ACOSTA, P.J.", "ANIL C. SINGH"],
+            "column gap should keep the two names apart"
+        );
+    }
+
+    #[test]
+    fn small_caps_merge_keeps_word_space_between_same_size_capitals() {
+        // Two uppercase words at sizes the merge band already accepts (9.98 and
+        // 9.0, a 10% drop) separated by a real word gap. The small-caps path
+        // must not claim this junction and swallow the space.
+        let items = vec![
+            make_item_fs("SEE", 100.0, 500.0, 18.0, 9.98),
+            make_item_fs("ALSO", 119.2, 500.0, 24.0, 9.0),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "got {:?}", merged);
+        assert_eq!(merged[0].text, "SEE ALSO");
+    }
+
+    #[test]
+    fn trailing_digit_is_not_a_capital_awaiting_small_caps() {
+        // "...MAZZARELLI1" ends in a footnote marker; the backward search for an
+        // uppercase letter must not skip the digit and glue the next run.
+        assert!(!is_small_caps_continuation(
+            "ANGELA M. MAZZARELLI1",
+            &make_item_fs("ANGELA", 100.0, 500.0, 40.0, 9.98),
+            &make_item_fs("SHULMAN", 140.0, 500.0, 30.0, 6.74),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn ordinal_suffix_after_a_digit_still_merges() {
+        // "TUESDAY, JULY 4" + "TH" is one word in the source; the digit guard
+        // must not block the four English ordinal suffixes.
+        for suffix in ["TH", "ST", "ND", "RD"] {
+            assert!(
+                is_small_caps_continuation(
+                    "TUESDAY, JULY 4",
+                    &make_item_fs("JULY", 100.0, 500.0, 30.0, 12.0),
+                    &make_item_fs(suffix, 130.0, 500.0, 8.0, 8.0),
+                    0.0,
+                ),
+                "{suffix} should merge after a digit"
+            );
+        }
+    }
+
+    #[test]
+    fn superscript_footnote_marker_is_not_a_small_caps_continuation() {
+        // A digit must never qualify — otherwise footnote markers get glued on
+        // without the superscript handling.
+        assert!(!is_small_caps_continuation(
+            "MAZZARELLI",
+            &make_item_fs("MAZZARELLI", 100.0, 500.0, 50.0, 9.98),
+            &make_item_fs("1", 150.0, 503.0, 3.0, 6.74),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn drop_cap_is_not_a_small_caps_continuation() {
+        // Mixed-case body text after a large initial is a drop cap, not small
+        // caps.
+        assert!(!is_small_caps_continuation(
+            "T",
+            &make_item_fs("T", 100.0, 500.0, 20.0, 30.0),
+            &make_item_fs("he court held", 120.0, 500.0, 60.0, 10.0),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn separate_word_is_not_a_small_caps_continuation() {
+        // A real word space disqualifies even when both runs are uppercase.
+        let first = make_item_fs("SEE", 100.0, 500.0, 20.0, 9.98);
+        let next = make_item_fs("ALSO", 128.0, 500.0, 25.0, 6.74);
+        assert!(!is_small_caps_continuation("SEE", &first, &next, 8.0));
+    }
+
+    #[test]
+    fn lowercase_continuation_is_not_small_caps() {
+        assert!(!is_small_caps_continuation(
+            "SMALL",
+            &make_item_fs("SMALL", 100.0, 500.0, 30.0, 9.98),
+            &make_item_fs("caps", 130.0, 500.0, 20.0, 6.74),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn too_small_a_ratio_is_not_small_caps() {
+        // 0.4 ratio is a superscript/sub-run, outside the small-caps band.
+        assert!(!is_small_caps_continuation(
+            "A",
+            &make_item_fs("A", 100.0, 500.0, 7.0, 10.0),
+            &make_item_fs("BC", 107.0, 500.0, 8.0, 4.0),
+            0.0,
+        ));
     }
 
     #[test]

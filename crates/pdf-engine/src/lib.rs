@@ -128,6 +128,21 @@ pub struct PageOcrReasons {
     pub reasons: Vec<String>,
 }
 
+/// An embedded raster image carried out of the PDF alongside the markdown.
+///
+/// `name` matches the URL used by the corresponding `![图片N](name)` marker,
+/// so callers can write the bytes next to the markdown and have the link
+/// resolve.
+#[derive(Debug, Clone)]
+pub struct PdfImage {
+    /// Asset file name, e.g. `image-1.jpg`.
+    pub name: String,
+    /// MIME type, e.g. `image/jpeg`.
+    pub mime_type: String,
+    /// Raw image file bytes (JPEG/PDF-passable formats are not re-encoded).
+    pub data: Vec<u8>,
+}
+
 /// High-level PDF processing result.
 #[derive(Debug)]
 pub struct PdfProcessResult {
@@ -135,6 +150,9 @@ pub struct PdfProcessResult {
     pub pdf_type: PdfType,
     /// Markdown output (populated in [`ProcessMode::Full`], `None` otherwise).
     pub markdown: Option<String>,
+    /// Embedded images extracted when [`MarkdownOptions::include_images`] is
+    /// set; names match the markdown image markers.
+    pub images: Vec<PdfImage>,
     /// Page count.
     pub page_count: u32,
     /// Processing time in milliseconds.
@@ -433,6 +451,14 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
+pub(crate) struct InternalPagesExtraction {
+    pub(crate) result: PagesExtractionResult,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) page_count: u32,
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    pub(crate) supplemental_ocr_regions: BTreeMap<u32, Vec<PdfRect>>,
+}
+
 /// Extract formatted markdown for pages of a PDF, with layout
 /// classification metadata.
 ///
@@ -455,8 +481,44 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        None,
+        &MarkdownOptions::default(),
+        false,
+        false,
+    )
+    .map(|extraction| extraction.result)
+}
+
+#[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+pub(crate) fn extract_pages_markdown_mem_for_ocr(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+) -> Result<InternalPagesExtraction, PdfError> {
+    extract_pages_markdown_mem_impl(
+        buffer,
+        pages,
+        password,
+        markdown_options,
+        markdown_options.strip_headers_footers,
+        true,
+    )
+}
+
+fn extract_pages_markdown_mem_impl(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    password: Option<&str>,
+    markdown_options: &MarkdownOptions,
+    strip_repeated_headers_footers: bool,
+    preserve_ocr_candidates: bool,
+) -> Result<InternalPagesExtraction, PdfError> {
     validate_pdf_bytes(buffer)?;
-    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let (doc, page_count) = load_document_from_mem_with_password(buffer, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
 
     // Extract ALL pages to get accurate, document-wide font stats. A malformed
@@ -499,6 +561,11 @@ pub fn extract_pages_markdown_mem(
 
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
+    let repeated_header_footer_items = if strip_repeated_headers_footers {
+        repeated_header_footer_item_keys(&all_items, &page_thresholds, &chart_regions, page_count)
+    } else {
+        HashSet::new()
+    };
 
     // When caller doesn't specify pages, return every page in document order.
     let all_pages: Vec<u32>;
@@ -513,6 +580,8 @@ pub fn extract_pages_markdown_mem(
     let mut results = Vec::with_capacity(pages_slice.len());
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
+    #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+    let mut supplemental_ocr_regions = BTreeMap::new();
     let lopdf_pages = doc.get_pages();
 
     for &page_0idx in pages_slice {
@@ -534,7 +603,10 @@ pub fn extract_pages_markdown_mem(
         let (page_items, page_number_removal_mask): (Vec<TextItem>, Vec<bool>) = all_items
             .iter()
             .zip(&page_number_removal_mask)
-            .filter(|(item, _)| item.page == page_1idx)
+            .filter(|(item, _)| {
+                item.page == page_1idx
+                    && !repeated_header_footer_items.contains(&HeaderFooterItemKey::from(*item))
+            })
             .map(|(item, remove)| (item.clone(), *remove))
             .unzip();
 
@@ -543,6 +615,23 @@ pub fn extract_pages_markdown_mem(
             .filter(|r| r.page == page_1idx)
             .cloned()
             .collect();
+
+        let page_lines: Vec<types::PdfLine> = all_lines
+            .iter()
+            .filter(|l| l.page == page_1idx)
+            .cloned()
+            .collect();
+
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        {
+            let image_regions: Vec<PdfRect> = page_items
+                .iter()
+                .filter_map(supplemental_ocr_image_region)
+                .collect();
+            if !image_regions.is_empty() {
+                supplemental_ocr_regions.insert(page_1idx, image_regions);
+            }
+        }
 
         let has_gid = gid_pages.contains(&page_1idx);
         let has_text_quality_issue = text_quality.pages_needing_ocr.contains(&page_1idx);
@@ -571,7 +660,7 @@ pub fn extract_pages_markdown_mem(
             base_font_size: Some(font_stats.most_common_size),
             include_page_numbers: false,
             strip_headers_footers: false,
-            ..MarkdownOptions::default()
+            ..markdown_options.clone()
         };
 
         let md = if has_text_quality_issue {
@@ -581,7 +670,7 @@ pub fn extract_pages_markdown_mem(
                 page_items,
                 options,
                 &page_rects,
-                &[],
+                &page_lines,
                 markdown::MarkdownDocumentContext {
                     page_thresholds: &page_thresholds,
                     struct_roles: None,
@@ -624,20 +713,180 @@ pub fn extract_pages_markdown_mem(
 
         results.push(PageMarkdown {
             page: page_0idx,
-            markdown: if needs_ocr { String::new() } else { md },
+            // The public native extractor continues to suppress unreliable
+            // text. The OCR orchestrator retains clean partial text
+            // internally so it can compare/fuse it with OCR before deciding
+            // what is safe to return.
+            markdown: if needs_ocr && !preserve_ocr_candidates {
+                String::new()
+            } else {
+                md
+            },
             needs_ocr,
             ocr_reason,
         });
     }
 
-    Ok(PagesExtractionResult {
-        pages: results,
-        pages_with_tables: complexity.pages_with_tables,
-        pages_with_columns: complexity.pages_with_columns,
-        pages_needing_ocr,
-        ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
-        is_complex: complexity.is_complex,
+    Ok(InternalPagesExtraction {
+        result: PagesExtractionResult {
+            pages: results,
+            pages_with_tables: complexity.pages_with_tables,
+            pages_with_columns: complexity.pages_with_columns,
+            pages_needing_ocr,
+            ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
+            is_complex: complexity.is_complex,
+        },
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        page_count,
+        #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
+        supplemental_ocr_regions,
     })
+}
+
+/// Image regions large enough to plausibly contain rasterized document
+/// structure such as a table. Logos, icons, and decorative rules remain below
+/// these physical-size gates. OCR still has to produce a valid table inside
+/// the region before any text is fused into a clean native page.
+#[cfg(any(test, all(feature = "ocr", not(target_arch = "wasm32"))))]
+fn supplemental_ocr_image_region(item: &TextItem) -> Option<PdfRect> {
+    const MIN_WIDTH_PT: f32 = 108.0;
+    const MIN_HEIGHT_PT: f32 = 72.0;
+    const MIN_AREA_PT2: f32 = 20_000.0;
+
+    if !matches!(item.item_type, types::ItemType::Image)
+        || !item.x.is_finite()
+        || !item.y.is_finite()
+        || !item.width.is_finite()
+        || !item.height.is_finite()
+    {
+        return None;
+    }
+    let x = item.x.min(item.x + item.width);
+    let y = item.y.min(item.y + item.height);
+    let width = item.width.abs();
+    let height = item.height.abs();
+    (width >= MIN_WIDTH_PT && height >= MIN_HEIGHT_PT && width * height >= MIN_AREA_PT2).then_some(
+        PdfRect {
+            x,
+            y,
+            width,
+            height,
+            page: item.page,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HeaderFooterItemKey {
+    page: u32,
+    x: u32,
+    y: u32,
+    text: String,
+}
+
+impl From<&TextItem> for HeaderFooterItemKey {
+    fn from(item: &TextItem) -> Self {
+        Self {
+            page: item.page,
+            x: item.x.to_bits(),
+            y: item.y.to_bits(),
+            text: item.text.clone(),
+        }
+    }
+}
+
+fn repeated_header_footer_item_keys(
+    items: &[TextItem],
+    page_thresholds: &HashMap<u32, f32>,
+    chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    page_count: u32,
+) -> HashSet<HeaderFooterItemKey> {
+    let candidates = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.item_type,
+                types::ItemType::Text | types::ItemType::FormField
+            )
+        })
+        .cloned()
+        .collect();
+    let lines = extractor::group_prefiltered_items_into_lines_with_thresholds_and_charts(
+        candidates,
+        page_thresholds,
+        &HashSet::new(),
+        chart_regions,
+    );
+    let all_items: HashSet<_> = lines
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    let kept = markdown::strip_repeated_header_footer_lines(lines, page_count);
+    let kept_items: HashSet<_> = kept
+        .iter()
+        .flat_map(|line| line.items.iter().map(HeaderFooterItemKey::from))
+        .collect();
+    all_items.difference(&kept_items).cloned().collect()
+}
+
+#[cfg(all(test, feature = "ocr", not(target_arch = "wasm32")))]
+mod ocr_header_footer_tests {
+    use super::*;
+
+    fn item(page: u32, text: &str, y: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 10.0,
+            y,
+            width: 120.0,
+            height: 10.0,
+            font: "Test".to_string(),
+            font_tag: String::new(),
+            font_size: 10.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn local_pipeline_prefilters_document_wide_repeated_headers() {
+        let mut items = Vec::new();
+        let mut thresholds = HashMap::new();
+        for page in 1..=3 {
+            items.push(item(page, "Repeated report header", 800.0));
+            for line in 0..12 {
+                items.push(item(
+                    page,
+                    &format!("Page {page} paragraph {line} unique content"),
+                    700.0 - line as f32 * 40.0,
+                ));
+            }
+            thresholds.insert(page, 0.1);
+        }
+
+        let removed = repeated_header_footer_item_keys(&items, &thresholds, &HashMap::new(), 3);
+        assert_eq!(removed.len(), 2);
+        for page in 1..=3 {
+            assert_eq!(
+                removed.contains(&HeaderFooterItemKey::from(&item(
+                    page,
+                    "Repeated report header",
+                    800.0,
+                ))),
+                page > 1,
+            );
+            assert!(!removed.contains(&HeaderFooterItemKey::from(&item(
+                page,
+                &format!("Page {page} paragraph 5 unique content"),
+                500.0,
+            ))));
+        }
+    }
 }
 
 /// Path-based wrapper for [`extract_pages_markdown_mem`].
@@ -652,6 +901,80 @@ pub fn extract_pages_markdown<P: AsRef<Path>>(
     validate_pdf_file(&path)?;
     let buffer = std::fs::read(path.as_ref())?;
     extract_pages_markdown_mem(&buffer, pages)
+}
+
+// =========================================================================
+// Structure-tree element extraction (tagged PDFs)
+// =========================================================================
+
+/// One structure-tree element reference from a tagged PDF, resolved to a
+/// page and Marked Content ID.
+///
+/// Join `(page, mcid)` against [`TextItem::page`] / [`TextItem::mcid`] from
+/// [`extract_text_with_positions`] to attach semantic roles (heading levels,
+/// paragraphs, table cells, …) to extracted text.
+#[derive(Debug, Clone)]
+pub struct StructureElement {
+    /// 1-indexed page number (matches [`TextItem::page`]).
+    pub page: u32,
+    /// Marked Content ID from the page's content stream (matches
+    /// [`TextItem::mcid`]).
+    pub mcid: i64,
+    /// Standard structure type name ("H1".."H6", "P", "Table", "TD", …).
+    /// Custom tags are resolved through the document's `/RoleMap`; tags
+    /// with no standard mapping are returned verbatim.
+    pub role: String,
+}
+
+/// Extract structure-tree element references from a tagged PDF in memory.
+///
+/// Parses `/StructTreeRoot` (when present) and returns one entry per
+/// marked-content reference, resolved to its 1-indexed page, MCID, and
+/// structure type name. Returns an empty list when the PDF is not tagged.
+///
+/// Pass `Some(&[...])` with 1-indexed page numbers (matching
+/// [`TextItem::page`]) to restrict output to those pages; pass `None` for
+/// the whole document. Entries are sorted by `(page, mcid)`.
+pub fn extract_structure_elements_mem(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+) -> Result<Vec<StructureElement>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, _page_count) = load_document_from_mem(buffer)?;
+    let Some(tree) = structure_tree::StructTree::from_doc(&doc) else {
+        return Ok(Vec::new());
+    };
+    let page_ids = doc.get_pages();
+    let roles = tree.mcid_to_roles(&page_ids);
+
+    let page_filter: Option<HashSet<u32>> = pages.map(|p| p.iter().copied().collect());
+    let mut elements: Vec<StructureElement> = roles
+        .into_iter()
+        .filter(|(page, _)| page_filter.as_ref().is_none_or(|f| f.contains(page)))
+        .flat_map(|(page, mcids)| {
+            mcids.into_iter().map(move |(mcid, role)| StructureElement {
+                page,
+                mcid,
+                role: role.name().to_string(),
+            })
+        })
+        .collect();
+    elements.sort_unstable_by_key(|e| (e.page, e.mcid));
+    Ok(elements)
+}
+
+/// Path-based wrapper for [`extract_structure_elements_mem`].
+///
+/// Reads the PDF from disk and extracts structure-tree element references.
+/// Pass `None` for `pages` to return the whole document, or `Some(&[...])`
+/// to restrict to specific 1-indexed pages.
+pub fn extract_structure_elements<P: AsRef<Path>>(
+    path: P,
+    pages: Option<&[u32]>,
+) -> Result<Vec<StructureElement>, PdfError> {
+    validate_pdf_file(&path)?;
+    let buffer = std::fs::read(path.as_ref())?;
+    extract_structure_elements_mem(&buffer, pages)
 }
 
 // =========================================================================
@@ -678,6 +1001,23 @@ pub struct PageRegionResult {
     pub page: u32,
     /// Per-region results, parallel to the input regions.
     pub regions: Vec<RegionText>,
+}
+
+/// Minimum alphanumeric mass an invisible (Tr 3) text layer must carry for
+/// the OCR-layer fallback in [`extract_text_in_regions_mem`] to adopt it. A
+/// real OCR layer carries far more; a stray watermark or artifact does not.
+const OCR_LAYER_MIN_ALNUM: usize = 40;
+
+/// Alphanumeric mass of extracted items, ignoring raster placeholders.
+/// `[Image: ...]` items (ItemType::Image) are synthesized for image
+/// XObjects — they mark that pixels exist, not that text was read, so they
+/// must not count as coverage.
+fn non_placeholder_alnum(items: &[TextItem]) -> usize {
+    items
+        .iter()
+        .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+        .map(|it| it.text.chars().filter(|c| c.is_alphanumeric()).count())
+        .sum()
 }
 
 /// Extract text within bounding-box regions from a PDF in memory.
@@ -732,8 +1072,11 @@ pub fn extract_text_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        // Extract text items for this page
-        let ((mut items, _rects, _lines), has_gid, coords_rotated) =
+        // Extract text items for this page. The Form XObject budget is shared
+        // with the invisible-layer retry below so one page cannot consume two
+        // full expansion budgets.
+        let mut form_budget = extractor::FormWalkBudget::new();
+        let ((mut items, _rects, _lines), mut has_gid, mut coords_rotated, skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -741,7 +1084,54 @@ pub fn extract_text_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut form_budget,
             )?;
+        // OCR-layer fallback: scanned pages often carry their text as an
+        // invisible (Tr 3) layer behind the page raster. The visible-only
+        // pass sees nothing there but `[Image: ...]` placeholders, so every
+        // region on the page reports needs_ocr even though the exact text is
+        // embedded in the PDF — and this extractor then disagrees with the
+        // markdown path, which already retries Mixed PDFs with the invisible
+        // layer included. Retry page-scoped, and only when (a) the first
+        // pass actually SKIPPED invisible text — blank pages and image-only
+        // scans without an OCR layer must not pay a second content-stream
+        // parse (review catch) — and (b) the page has NO visible text item
+        // at all (punctuation counts, whitespace-only artifacts don't): an
+        // invisible OCR layer transcribes the raster, so any visible glyph
+        // has an invisible twin there and adoption would duplicate it
+        // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
+        // only when it contributes real, non-garbage text.
+        let has_visible_text = items.iter().any(|it| {
+            !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
+        });
+        if skipped_invisible && !has_visible_text {
+            if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
+                extractor::content_stream::extract_page_text_items(
+                    &doc,
+                    page_id,
+                    *page_num,
+                    &font_cmaps,
+                    true,
+                    &mut style_cache,
+                    &mut form_budget,
+                )
+            {
+                let inv_alnum = non_placeholder_alnum(&inv_items);
+                // Judge the WHOLE recovered layer, not a prefix — a broken
+                // OCR layer can hide its garbage past any fixed sample size
+                // (review catch).
+                let sample: String = inv_items
+                    .iter()
+                    .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+                    .map(|it| it.text.as_str())
+                    .collect();
+                if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
+                    items = inv_items;
+                    has_gid = inv_gid;
+                    coords_rotated = inv_rotated;
+                }
+            }
+        }
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -898,7 +1288,7 @@ pub fn extract_tables_in_regions_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, rects, lines), has_gid, coords_rotated) =
+        let ((mut items, rects, lines), has_gid, coords_rotated, _skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -906,6 +1296,7 @@ pub fn extract_tables_in_regions_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -1209,7 +1600,7 @@ pub fn detect_vector_grid_in_region_mem(
     let needed_pages = HashSet::from([page_1idx]);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
     let page_h = get_page_height(&doc, page_id).unwrap_or(792.0);
-    let ((mut items, rects, lines), _has_gid, coords_rotated) =
+    let ((mut items, rects, lines), _has_gid, coords_rotated, _skipped_invisible) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -1217,6 +1608,7 @@ pub fn detect_vector_grid_in_region_mem(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            &mut extractor::FormWalkBudget::new(),
         )?;
     text_utils::fix_letterspaced_items(&mut items);
 
@@ -1403,15 +1795,17 @@ mod vector_grid_tests {
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            1,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                1,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FormWalkBudget::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, 1);
         assert_eq!(rect_tables.len(), 1, "expected one rect-detected table");
@@ -1445,15 +1839,17 @@ mod vector_grid_tests {
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-        let ((items, rects, _lines), _has_gid, _rotated) = extract_page_text_items(
-            &doc,
-            page_id,
-            page_num,
-            &cmaps,
-            false,
-            &mut crate::extractor::FontStyleCache::new(),
-        )
-        .unwrap();
+        let ((items, rects, _lines), _has_gid, _rotated, _skipped_invisible) =
+            extract_page_text_items(
+                &doc,
+                page_id,
+                page_num,
+                &cmaps,
+                false,
+                &mut crate::extractor::FontStyleCache::new(),
+                &mut crate::extractor::FormWalkBudget::new(),
+            )
+            .unwrap();
 
         let (rect_tables, _) = detect_tables_from_rects(&items, &rects, page_num);
         rect_tables
@@ -2181,7 +2577,7 @@ pub fn extract_tables_with_structure_cells_mem(
         let height = get_page_height(&doc, page_id).unwrap_or(792.0);
         page_heights.insert(*page_num, height);
 
-        let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+        let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
             extractor::content_stream::extract_page_text_items(
                 &doc,
                 page_id,
@@ -2189,6 +2585,7 @@ pub fn extract_tables_with_structure_cells_mem(
                 &font_cmaps,
                 false,
                 &mut style_cache,
+                &mut extractor::FormWalkBudget::new(),
             )?;
         let threshold = text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
@@ -2983,7 +3380,7 @@ fn detect_tsr_quality_issue(
     let mut needed: HashSet<u32> = HashSet::new();
     needed.insert(page_1idx);
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
-    let ((mut items, _rects, _lines), _has_gid, coords_rotated) =
+    let ((mut items, _rects, _lines), _has_gid, coords_rotated, _skipped_invisible) =
         extractor::content_stream::extract_page_text_items(
             &doc,
             page_id,
@@ -2991,6 +3388,7 @@ fn detect_tsr_quality_issue(
             &font_cmaps,
             false,
             &mut extractor::FontStyleCache::new(),
+            &mut extractor::FormWalkBudget::new(),
         )?;
     let adaptive_threshold = text_utils::fix_letterspaced_items(&mut items);
     let coords = if coords_rotated {
@@ -3744,6 +4142,7 @@ fn process_document(
     // DetectOnly → return immediately
     if options.mode == ProcessMode::DetectOnly {
         return Ok(PdfProcessResult {
+            images: Vec::new(),
             pdf_type,
             markdown: None,
             page_count,
@@ -3760,6 +4159,7 @@ fn process_document(
     // Scanned / ImageBased → nothing to extract
     if matches!(pdf_type, PdfType::Scanned | PdfType::ImageBased) {
         return Ok(PdfProcessResult {
+            images: Vec::new(),
             pdf_type,
             markdown: None,
             page_count,
@@ -3774,6 +4174,7 @@ fn process_document(
     }
 
     // Step 2 — Extraction (reuses the already-loaded document)
+    let mut pdf_images: Vec<PdfImage> = Vec::new();
     let extracted = {
         let font_cmaps = FontCMaps::from_doc(&doc);
         // Most page-filtered requests extract only the selected pages. Gather
@@ -3950,6 +4351,16 @@ fn process_document(
                 page_count,
                 options.page_filter.as_ref(),
             );
+            let mut items = items;
+
+            // Embedded-image extraction: rewrite image items' placeholder
+            // text to final asset names and collect the raw bytes, so the
+            // markdown markers link to files the caller can write.
+            pdf_images = if options.mode == ProcessMode::Full && options.markdown.include_images {
+                extract_embedded_images(&doc, &mut items)
+            } else {
+                Vec::new()
+            };
 
             let text_quality = analyze_text_quality(&items);
             merge_ocr_reasons(&mut ocr_reasons_by_page, text_quality.reasons_by_page);
@@ -4088,6 +4499,7 @@ fn process_document(
     };
 
     Ok(PdfProcessResult {
+        images: pdf_images,
         pdf_type,
         markdown,
         page_count,
@@ -4110,6 +4522,99 @@ fn process_document(
 // =========================================================================
 // Internal helpers
 // =========================================================================
+
+/// Extract embedded raster images for the markdown image markers.
+///
+/// Rewrites each image item's `text` from the legacy `[Image: Im0]` form to
+/// the final asset file name (`image-{seq}.{ext}`), walking image items in
+/// the same reading order the markdown stage uses to number markers, so the
+/// `![图片N](name)` URLs resolve once the caller writes the returned bytes
+/// next to the markdown.
+fn extract_embedded_images(doc: &Document, items: &mut [types::TextItem]) -> Vec<PdfImage> {
+    use extractor::xobjects::{get_page_xobjects, XObjectType};
+    use lopdf::ObjectId;
+    use std::collections::HashMap;
+
+    let mut order: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item.item_type, types::ItemType::Image))
+        .map(|(idx, _)| idx)
+        .collect();
+    // Mirror the markdown stage's ordering: page asc, baseline desc, x asc.
+    order.sort_by(|&a, &b| {
+        items[a]
+            .page
+            .cmp(&items[b].page)
+            .then_with(|| items[b].y.total_cmp(&items[a].y))
+            .then_with(|| items[a].x.total_cmp(&items[b].x))
+    });
+
+    let page_ids = doc.get_pages();
+    // Per-page XObject resource-name → image object id.
+    let mut name_maps: HashMap<u32, HashMap<String, ObjectId>> = HashMap::new();
+    let mut out = Vec::new();
+    for (n, &idx) in order.iter().enumerate() {
+        let seq = n + 1;
+        let page = items[idx].page;
+        let Some(name) = items[idx]
+            .text
+            .strip_prefix("[Image: ")
+            .and_then(|text| text.strip_suffix(']'))
+        else {
+            continue;
+        };
+        let map = name_maps.entry(page).or_insert_with(|| {
+            let mut map = HashMap::new();
+            if let Some(&page_id) = page_ids.get(&page) {
+                for (resource_name, kind) in get_page_xobjects(doc, page_id) {
+                    if let XObjectType::Image(id) = kind {
+                        map.insert(resource_name, id);
+                    }
+                }
+            }
+            map
+        });
+        let Some(&id) = map.get(name) else {
+            continue;
+        };
+        let Some((bytes, ext, mime)) = embedded_image_bytes(doc, id) else {
+            continue;
+        };
+        let file = format!("image-{seq}.{ext}");
+        items[idx].text = file.clone();
+        out.push(PdfImage {
+            name: file,
+            mime_type: mime.to_owned(),
+            data: bytes,
+        });
+    }
+    out
+}
+
+/// Raw file bytes of an embedded image object. Only formats that can be
+/// written to disk verbatim (JPEG, JPEG2000) are passed through;
+/// Flate-compressed sample data would need pixel re-encoding and is skipped.
+fn embedded_image_bytes(
+    doc: &Document,
+    id: lopdf::ObjectId,
+) -> Option<(Vec<u8>, &'static str, &'static str)> {
+    use lopdf::Object;
+    let Object::Stream(stream) = doc.get_object(id).ok()? else {
+        return None;
+    };
+    let filter = stream.dict.get(b"Filter").ok()?;
+    let filter_name = match filter {
+        Object::Name(name) => Some(name.as_slice()),
+        Object::Array(filters) if filters.len() == 1 => filters.first()?.as_name().ok(),
+        _ => None,
+    }?;
+    match filter_name {
+        b"DCTDecode" => Some((stream.content.clone(), "jpg", "image/jpeg")),
+        b"JPXDecode" => Some((stream.content.clone(), "jp2", "image/jp2")),
+        _ => None,
+    }
+}
 
 fn suspected_garbled_reason() -> String {
     OCR_REASON_SUSPECTED_GARBLED_TEXT.to_string()
@@ -4994,6 +5499,7 @@ mod text_cluster_column_undercount_tests {
             width: text.len() as f32 * 5.0,
             height: 10.0,
             font: "F".into(),
+            font_tag: String::new(),
             font_size: 10.0,
             page: 1,
             is_bold: false,
@@ -5270,6 +5776,7 @@ mod table_candidate_selection_tests {
             width: 50.0,
             height: 10.0,
             font: "F1".to_string(),
+            font_tag: String::new(),
             font_size: 10.0,
             page: 1,
             is_bold: false,
@@ -5921,40 +6428,18 @@ fn compute_layout_complexity_with_chart_regions(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PdfError {
-    Io(std::io::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("PDF parsing error: {0}")]
     Parse(String),
+    #[error("PDF is encrypted")]
     Encrypted,
+    #[error("Invalid PDF structure")]
     InvalidStructure,
+    #[error("Not a PDF: {0}")]
     NotAPdf(String),
-}
-
-impl std::fmt::Display for PdfError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(formatter, "IO error: {error}"),
-            Self::Parse(error) => write!(formatter, "PDF parsing error: {error}"),
-            Self::Encrypted => formatter.write_str("PDF is encrypted"),
-            Self::InvalidStructure => formatter.write_str("invalid PDF structure"),
-            Self::NotAPdf(error) => write!(formatter, "not a PDF: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for PdfError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for PdfError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
 }
 
 impl From<lopdf::Error> for PdfError {
@@ -6122,6 +6607,7 @@ mod tests {
             width,
             height,
             font: "Helvetica".to_string(),
+            font_tag: String::new(),
             font_size: height,
             page: 1,
             is_bold: false,
@@ -6138,6 +6624,36 @@ mod tests {
             page,
             ..test_item(text, 10.0, 10.0, text.len() as f32 * 5.0, 12.0)
         }
+    }
+
+    fn test_image_item(width: f32, height: f32) -> TextItem {
+        TextItem {
+            item_type: ItemType::Image,
+            ..test_item("[Image]", 20.0, 30.0, width, height)
+        }
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_require_substantial_physical_images() {
+        let substantial = supplemental_ocr_image_region(&test_image_item(200.0, 120.0)).unwrap();
+        assert_eq!(substantial.width, 200.0);
+        assert_eq!(substantial.height, 120.0);
+
+        assert!(supplemental_ocr_image_region(&test_image_item(100.0, 200.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(200.0, 60.0)).is_none());
+        assert!(supplemental_ocr_image_region(&test_image_item(120.0, 100.0)).is_none());
+        assert!(
+            supplemental_ocr_image_region(&test_item("text", 0.0, 0.0, 300.0, 300.0)).is_none()
+        );
+    }
+
+    #[test]
+    fn supplemental_ocr_regions_normalize_negative_image_dimensions() {
+        let region = supplemental_ocr_image_region(&test_image_item(-200.0, -120.0)).unwrap();
+        assert_eq!(region.x, -180.0);
+        assert_eq!(region.y, -90.0);
+        assert_eq!(region.width, 200.0);
+        assert_eq!(region.height, 120.0);
     }
 
     #[test]

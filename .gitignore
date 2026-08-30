@@ -2,7 +2,10 @@
 *.node
 node_modules/
 dist/
+packages/*/npm/
 .DS_Store
 .env
 runtime-data/
-
+.repos
+test-files/
+packages/file-parser/test-ocr.py
