@@ -25,3 +25,20 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Package changes must ship a changeset, otherwise they never reach npm.
+  # The changesets-action version PRs do not run this check (events raised by
+  # GITHUB_TOKEN trigger no workflows).
+  changesets:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: packages/ changes require a changeset
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -qE '^(packages|bindings)/' || exit 0
+          compgen -G '.changeset/*.md' > /dev/null && exit 0
+          echo '::error::Changes under packages/ or bindings/ must include a changeset (bunx changeset).'
+          exit 1

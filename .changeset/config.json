@@ -1,0 +1,8 @@
+{
+  "changelog": ["@changesets/changelog-github", { "repo": "Ventorium/VentoAgentRuntime" }],
+  "commit": false,
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "privatePackages": { "version": false, "tag": false }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "vento-agent-runtime",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "version-packages": "changeset version"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.5.1",
+    "@changesets/cli": "^2.29.4"
+  }
+}

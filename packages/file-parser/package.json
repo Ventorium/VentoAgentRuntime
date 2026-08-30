@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "Rust-native file parser converting enterprise documents to LLM Markdown",
   "license": "MIT",
-  "repository": "github:Ventorium/VentoAgentRuntime",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ventorium/VentoAgentRuntime.git"
+  },
   "type": "commonjs",
   "main": "index.js",
   "types": "index.d.ts",

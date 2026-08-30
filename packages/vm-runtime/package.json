@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "N-API client for VentoAgentRuntime Firecracker sandboxes",
   "license": "MIT",
-  "repository": "github:Ventorium/VentoAgentRuntime",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ventorium/VentoAgentRuntime.git"
+  },
   "type": "commonjs",
   "main": "index.js",
   "types": "index.d.ts",
