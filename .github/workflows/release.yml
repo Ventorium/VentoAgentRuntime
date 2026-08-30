@@ -148,7 +148,10 @@ jobs:
         run: |
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
-          if npm view "$name@$version" version > /dev/null 2>&1; then
+          # Probe the versioned packument directly: the root packument that
+          # `npm view` fetches stays CDN-stale for a while after publishing.
+          url="https://registry.npmjs.org/${name//\//%2F}/$version"
+          if curl -fsSL -o /dev/null "$url"; then
             echo "$name@$version is already published; skipping."
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
