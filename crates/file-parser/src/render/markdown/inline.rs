@@ -1,6 +1,7 @@
 //! Inline run normalization and rendering.
 
 use crate::model::{ImageSource, Inline, LinkTarget, Style, checkbox_text, inlines_are_empty};
+use crate::ocr::compose_alt;
 use crate::render::markdown::Ctx;
 use crate::render::markdown::escape::{
     Delims, EscapeOpts, InlineContext, backtick_fence, escape_cell_code_span, escape_text,
@@ -144,7 +145,7 @@ fn render_inlines_mode(inlines: &[Inline], ctx: InlineContext, in_label: bool, r
                 }
             }
             Norm::Link { content, target } => render_link(content, target, ctx, rc, &mut out),
-            Norm::Image { alt, source } => render_image(alt, source, ctx, in_label, &mut out),
+            Norm::Image { alt, source } => render_image(alt, source, ctx, rc, &mut out),
             Norm::Anchor(id) => {
                 if let Some(html_id) = rc.anchors.html_id(id) {
                     let _ = write!(out, "<a id=\"{html_id}\"></a>");
@@ -205,13 +206,7 @@ fn render_link(
     }
 }
 
-fn render_image(
-    alt: &str,
-    source: &ImageSource,
-    ctx: InlineContext,
-    in_label: bool,
-    out: &mut String,
-) {
+fn render_image(alt: &str, source: &ImageSource, ctx: InlineContext, rc: &Ctx, out: &mut String) {
     match source {
         ImageSource::External(url) => {
             let alt = escape_text(
@@ -224,20 +219,17 @@ fn render_image(
             );
             let _ = write!(out, "![{}]({})", alt, format_url(url));
         }
-        // Embedded assets render as their alt text: Markdown cannot embed
-        // bytes, and the bytes stay available in `Document::assets`. A
-        // source-less image has only its alt text to offer.
-        ImageSource::Asset(_) | ImageSource::Unavailable => {
-            if !alt.trim().is_empty() {
-                out.push_str(&escape_text(
-                    alt.trim(),
-                    ctx,
-                    EscapeOpts {
-                        in_label,
-                        ..Default::default()
-                    },
-                ));
-            }
+        // Embedded assets cannot be inlined as bytes, so the marker carries
+        // the signal instead: a fixed `图片` alt (plus OCR text when the
+        // image-OCR pass ran) tells readers an image exists here; the bytes
+        // stay available in `Document::assets`. `?` is a deliberate non-URL.
+        ImageSource::Asset(id) => {
+            let alt = compose_alt(alt, rc.asset_ocr.get(id));
+            let _ = write!(out, "![{alt}](?)");
+        }
+        ImageSource::Unavailable => {
+            let alt = compose_alt(alt, None);
+            let _ = write!(out, "![{alt}](?)");
         }
     }
 }
@@ -303,8 +295,17 @@ fn delims_of(run: &Norm, rc: &Ctx) -> Delims {
         Norm::Image { alt, source } => match source {
             ImageSource::External(_) if alt.contains('`') => delims.insert('`'),
             ImageSource::External(_) => {}
-            // Sourceless images degrade to their alt as plain text.
-            ImageSource::Asset(_) | ImageSource::Unavailable => delims.insert_closers(alt),
+            // Composed alts escape their brackets; only backticks can pair.
+            ImageSource::Asset(id) => {
+                if compose_alt(alt, rc.asset_ocr.get(id)).contains('`') {
+                    delims.insert('`');
+                }
+            }
+            ImageSource::Unavailable => {
+                if compose_alt(alt, None).contains('`') {
+                    delims.insert('`');
+                }
+            }
         },
         Norm::NoteRef(_)
         | Norm::Anchor(_)

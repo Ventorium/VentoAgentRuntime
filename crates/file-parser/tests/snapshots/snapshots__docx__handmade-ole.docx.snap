@@ -1,7 +1,7 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 Before the object
 
-Embedded object: Excel.Sheet.12
+![图片：Embedded object: Excel.Sheet.12](?)

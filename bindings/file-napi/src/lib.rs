@@ -34,7 +34,7 @@ pub async fn convert_bytes(
         )
         .await
         .map_err(runtime_error)?;
-    serde_json::to_string(&result).map_err(invalid)
+    Ok(result.markdown)
 }
 
 #[napi]

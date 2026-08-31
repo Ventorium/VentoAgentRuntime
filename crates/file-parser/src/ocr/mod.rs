@@ -1,6 +1,7 @@
 //! Remote OCR integration. OCR is delegated to an HTTP provider (currently
 //! PaddleOCR); the runtime never bundles OCR models itself.
 
+mod image_pass;
 mod paddle;
 
 use async_trait::async_trait;
@@ -8,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+pub(crate) use image_pass::{
+    ImageOcrConfig, OcrImage, OcrOutcome, compose_alt, content_hash, ensure_image_extension,
+    run_image_ocr,
+};
 pub use paddle::{PaddleOcrConfig, PaddleOcrProvider};
 
 /// A single OCR job: the file (image or PDF) plus its name and language.

@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 Rich objects follow.
@@ -15,8 +15,8 @@ Rich objects follow.
 - Build
 - Ship
 
-tiny dot image
+![图片：tiny dot image](?)
 
-Embedded object: Excel.Sheet.12
+![图片：Embedded object: Excel.Sheet.12](?)
 
 After the objects.

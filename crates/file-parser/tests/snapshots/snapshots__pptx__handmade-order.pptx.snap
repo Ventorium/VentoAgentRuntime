@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 Kicker before the title
@@ -8,4 +8,4 @@ Kicker before the title
 
 Body after the title
 
-Quarterly numbers
+![图片：Quarterly numbers](?)

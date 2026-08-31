@@ -6,8 +6,9 @@ const dir = path.resolve(__dirname, '../../test-files');
 const outDir = path.resolve(__dirname, '../../test-files/out');
 fs.mkdirSync(outDir, { recursive: true });
 
-// Images route to remote OCR; without a provider they fail with OCR_REQUIRED.
-// Token comes from PADDLE_OCR_TOKEN, falling back to the dev token in test-ocr.py.
+// Embedded-image OCR routes to the remote provider; without credentials the
+// images degrade to plain `![图片](?)` markers. Token comes from
+// PADDLE_OCR_TOKEN, never hardcoded.
 const ocrToken = process.env.PADDLE_OCR_TOKEN || '';
 const options = JSON.stringify({
   paddleOcr: {
@@ -24,32 +25,12 @@ const options = JSON.stringify({
     const data = fs.readFileSync(path.join(dir, f));
     console.log(`converting ${f}...`);
     try {
-      const result = JSON.parse(await convertBytes(data, f, options));
+      // The binding now returns the markdown string directly.
+      const markdown = await convertBytes(data, f, options);
       const base = f.replace(/\.[^.]+$/, '');
       const mdPath = path.join(outDir, `${base}.md`);
-      fs.writeFileSync(mdPath, result.markdown, 'utf8');
-      // Embedded images: write next to the markdown so marker URLs resolve.
-      for (const img of result.images || []) {
-        fs.writeFileSync(path.join(outDir, img.name), Buffer.from(img.dataBase64, 'base64'));
-      }
-      fs.writeFileSync(
-        path.join(outDir, `${base}.meta.json`),
-        JSON.stringify(
-          {
-            title: result.title,
-            source: result.source,
-            decisions: result.decisions,
-            warnings: result.warnings,
-            images: (result.images || []).map((img) => img.name),
-            durationMs: result.durationMs,
-          },
-          null,
-          2,
-        ),
-        'utf8',
-      );
-      const imgCount = (result.images || []).length;
-      console.log(`${f} -> ${mdPath} (${result.markdown.length} chars, ${imgCount} images, ${result.durationMs}ms)`);
+      fs.writeFileSync(mdPath, markdown, 'utf8');
+      console.log(`${f} -> ${mdPath} (${markdown.length} chars)`);
     } catch (e) {
       console.log(`${f} -> ERROR: ${e.message}`);
     }

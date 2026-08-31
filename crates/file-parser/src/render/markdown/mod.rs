@@ -8,7 +8,9 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+use crate::model::AssetId;
 use crate::model::{Block, Document, Inline, List, MarkerKind, Note, TableKind, inlines_are_empty};
+use crate::ocr::OcrOutcome;
 use anchors::{AnchorMap, resolve_anchors};
 use escape::{EscapeOpts, InlineContext, backtick_fence, escape_text};
 use inline::render_inlines;
@@ -38,12 +40,20 @@ type NoteNumbers = HashMap<String, usize>;
 pub(crate) struct Ctx {
     nums: NoteNumbers,
     anchors: AnchorMap,
+    /// Per-asset OCR outcomes produced by the embedded-image OCR pass;
+    /// assets without an entry render a plain `图片` alt.
+    asset_ocr: HashMap<AssetId, OcrOutcome>,
 }
 
-pub fn document_to_markdown(doc: &Document) -> String {
+/// Render with per-asset OCR alt text for embedded images.
+pub fn document_to_markdown_with_ocr(
+    doc: &Document,
+    asset_ocr: HashMap<AssetId, OcrOutcome>,
+) -> String {
     let rc = Ctx {
         nums: number_notes(doc),
         anchors: resolve_anchors(doc),
+        asset_ocr,
     };
     let mut parts: Vec<String> = doc
         .blocks
@@ -84,6 +94,11 @@ pub fn document_to_markdown(doc: &Document) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Render without embedded-image OCR (no provider configured).
+pub fn document_to_markdown(doc: &Document) -> String {
+    document_to_markdown_with_ocr(doc, HashMap::new())
 }
 
 /// Number notes in first-reference order; unreferenced notes follow at the

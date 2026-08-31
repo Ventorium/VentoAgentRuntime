@@ -2,6 +2,7 @@
 //! remote OCR fallback for scanned pages and standalone images, size limits,
 //! and path sandboxing. Everything funnels into [`FileParser::convert`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,11 @@ use serde_json::{Map, Value};
 
 use crate::ConvertError;
 use crate::Format;
-use crate::ocr::{OcrOptions, OcrProvider, OcrRequest};
+use crate::ocr::{
+    ImageOcrConfig, OcrImage, OcrOptions, OcrOutcome, OcrProvider, OcrRequest, compose_alt,
+    content_hash, ensure_image_extension, run_image_ocr,
+};
+use crate::render::markdown::document_to_markdown_with_ocr;
 
 /// What to convert: raw bytes, or a path inside the configured roots.
 #[derive(Clone, Debug)]
@@ -46,6 +51,25 @@ pub struct ConvertOptions {
     pub max_input_bytes: Option<u64>,
     /// Per-call override of the path sandbox roots.
     pub allowed_roots: Vec<PathBuf>,
+    /// OCR the images embedded in documents (docx/pdf/…), rendering them as
+    /// `![图片，OCR识别文字是：…](?)`. Defaults to true; a no-op without a
+    /// configured provider.
+    pub image_ocr: Option<bool>,
+    /// Long-side cap (px) for images sent to OCR; larger ones are downscaled
+    /// proportionally first. Defaults to 1024.
+    pub image_ocr_max_dimension: Option<u32>,
+    /// Maximum concurrent per-image OCR requests. Defaults to 4.
+    pub image_ocr_concurrency: Option<usize>,
+    /// Per-image OCR budget in milliseconds. Defaults to 60000.
+    pub image_ocr_timeout_ms: Option<u64>,
+}
+
+/// Per-conversion OCR setup threaded through format dispatch: the language
+/// hint and the embedded-image pass knobs, resolved once from
+/// [`ConvertOptions`].
+struct OcrSetup<'a> {
+    language: Option<&'a str>,
+    images: ImageOcrConfig,
 }
 
 /// One routing decision the runtime made while converting (extract, ocr, ...).
@@ -320,7 +344,10 @@ impl FileParser {
     ) -> Result<ConvertResult, RuntimeError> {
         let started = Instant::now();
         let max = options.max_input_bytes.unwrap_or(self.max_input_bytes);
-        let ocr_language = options.ocr_language.clone();
+        let ocr = OcrSetup {
+            language: options.ocr_language.as_deref(),
+            images: ImageOcrConfig::from(&options),
+        };
         let allowed_roots = if options.allowed_roots.is_empty() {
             self.allowed_roots.clone()
         } else {
@@ -370,21 +397,14 @@ impl FileParser {
         let mut images: Vec<ImageAsset> = Vec::new();
         let markdown = match format {
             Some(format) => {
-                self.convert_format(
-                    format,
-                    &bytes,
-                    &file_name,
-                    ocr_language.as_deref(),
-                    &mut context,
-                    &mut images,
-                )
-                .await?
+                self.convert_format(format, &bytes, &file_name, &ocr, &mut context, &mut images)
+                    .await?
             }
             None => {
                 // No document format applies. Fall back by extension:
                 // images go to OCR, recognized text files pass through.
                 if is_image_extension(&file_name) {
-                    self.run_ocr(&bytes, &file_name, ocr_language.as_deref(), &mut context)
+                    self.run_ocr(&bytes, &file_name, ocr.language, &mut context)
                         .await?
                 } else if let Some(kind) = text_kind(&file_name) {
                     let markdown = text_to_markdown(&bytes, kind)?;
@@ -433,23 +453,26 @@ impl FileParser {
     }
 
     /// Convert via a detected document format. PDF gets its own path with an
-    /// OCR fallback; everything else goes through the document model.
+    /// OCR fallback; everything else goes through the document model, with
+    /// the embedded-image OCR pass folded into the markdown rendering.
     async fn convert_format(
         &self,
         format: Format,
         bytes: &[u8],
         file_name: &str,
-        ocr_language: Option<&str>,
+        ocr: &OcrSetup<'_>,
         context: &mut ConvertContext,
         images: &mut Vec<ImageAsset>,
     ) -> Result<String, RuntimeError> {
         match format {
             Format::Pdf => {
-                self.convert_pdf(bytes, file_name, ocr_language, context, images)
+                self.convert_pdf(bytes, file_name, ocr, context, images)
                     .await
             }
             _ => {
-                let markdown = crate::to_markdown_bytes(bytes, Some(format))?;
+                let doc = crate::to_document(bytes, Some(format))?;
+                let asset_ocr = self.ocr_document_assets(&doc, ocr).await;
+                let markdown = document_to_markdown_with_ocr(&doc, asset_ocr);
                 context.decisions.push(Decision {
                     target: file_name.to_owned(),
                     action: "extract".into(),
@@ -461,13 +484,42 @@ impl FileParser {
         }
     }
 
+    /// Run the embedded-image OCR pass over a parsed document's image assets
+    /// and key the outcomes by asset id for the markdown renderer.
+    async fn ocr_document_assets(
+        &self,
+        doc: &crate::model::Document,
+        ocr: &OcrSetup<'_>,
+    ) -> HashMap<crate::model::AssetId, OcrOutcome> {
+        let targets: Vec<OcrImage> = doc
+            .assets
+            .iter()
+            .filter(|asset| asset.media_type.starts_with("image/"))
+            .map(|asset| OcrImage {
+                bytes: asset.bytes.clone(),
+                file_name: ensure_image_extension(&asset.origin_part, &asset.media_type),
+            })
+            .collect();
+        if targets.is_empty() {
+            return HashMap::new();
+        }
+        let outcomes = run_image_ocr(&targets, &ocr.images, self.ocr.clone(), ocr.language).await;
+        doc.assets
+            .iter()
+            .filter_map(|asset| {
+                let outcome = outcomes.get(&content_hash(&asset.bytes)).cloned()?;
+                Some((asset.id, outcome))
+            })
+            .collect()
+    }
+
     /// Extract the PDF text layer; on `NeedsOcr`, reroute the named pages
     /// through the OCR provider.
     async fn convert_pdf(
         &self,
         bytes: &[u8],
         file_name: &str,
-        ocr_language: Option<&str>,
+        ocr: &OcrSetup<'_>,
         context: &mut ConvertContext,
         images: &mut Vec<ImageAsset>,
     ) -> Result<String, RuntimeError> {
@@ -479,12 +531,32 @@ impl FileParser {
                     reason: "pdf-inspector text layer".into(),
                     confidence: None,
                 });
+                // OCR the extracted figures and fold the text into their
+                // `![图片N](name)` markers before the asset renaming below.
+                let mut markdown = output.markdown;
+                let targets: Vec<OcrImage> = output
+                    .images
+                    .iter()
+                    .map(|image| OcrImage {
+                        bytes: image.data.clone(),
+                        file_name: ensure_image_extension(&image.name, &image.mime_type),
+                    })
+                    .collect();
+                let outcomes =
+                    run_image_ocr(&targets, &ocr.images, self.ocr.clone(), ocr.language).await;
+                for image in &output.images {
+                    let marker = format!(
+                        "![{}](?)",
+                        compose_alt("", outcomes.get(&content_hash(&image.data)))
+                    );
+                    markdown = replace_pdf_image_markers(&markdown, &image.name, &marker);
+                }
                 // Namespace the asset names by the document stem so several
                 // PDFs converted into one directory do not collide, and keep
-                // the markdown marker URLs in sync.
+                // the markdown marker URLs in sync. Figures that resolved to
+                // no extracted object keep their placeholder URLs.
                 let stem = file_stem(file_name);
-                let mut markdown = output.markdown;
-                if !output.images.is_empty() {
+                if markdown.contains("](image-") {
                     markdown = markdown.replace("](image-", &format!("]({stem}-image-"));
                 }
                 for image in output.images {
@@ -503,7 +575,7 @@ impl FileParser {
                 let provider = self.ocr.as_ref().ok_or_else(|| RuntimeError::OcrRequired {
                     pages: pages.clone(),
                 })?;
-                let language = ocr_language.map(str::to_owned);
+                let language = ocr.language.map(str::to_owned);
                 let result = provider
                     .recognize(
                         OcrRequest {
@@ -648,6 +720,33 @@ fn safe_file_name(name: &str) -> Result<String, RuntimeError> {
         )));
     }
     Ok(name.to_owned())
+}
+
+/// Replace every `![图片N](name)` marker — for any sequence number `N` —
+/// with `replacement`. pdf-engine numbers markers independently of the
+/// extracted asset names, so the match keys on the URL only.
+fn replace_pdf_image_markers(markdown: &str, name: &str, replacement: &str) -> String {
+    let needle = format!("]({name})");
+    let marker_alt = "![图片";
+    let mut out = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(pos) = rest.find(&needle) {
+        let before = &rest[..pos];
+        if let Some(start) = before.rfind(marker_alt) {
+            let digits = &before[start + marker_alt.len()..];
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                out.push_str(&rest[..start]);
+                out.push_str(replacement);
+                rest = &rest[pos + needle.len()..];
+                continue;
+            }
+        }
+        // Not an image marker; keep the occurrence intact.
+        out.push_str(&rest[..pos + needle.len()]);
+        rest = &rest[pos + needle.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn file_stem(name: &str) -> String {

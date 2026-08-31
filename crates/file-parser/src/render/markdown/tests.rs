@@ -364,7 +364,7 @@ fn sourceless_image_renders_alt_text() {
         alt: "chart".into(),
         source: ImageSource::Unavailable,
     }])]);
-    assert_eq!(md, "chart\n");
+    assert_eq!(md, "![图片：chart](?)\n");
 }
 
 #[test]

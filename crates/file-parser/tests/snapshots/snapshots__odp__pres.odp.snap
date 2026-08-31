@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 Deck Title Slide
@@ -16,6 +16,8 @@ Numbers Slide
 | Region | Total |
 | --- | --- |
 | North | 42 |
+
+![图片](?)
 
 Grouped shapes below.
 
