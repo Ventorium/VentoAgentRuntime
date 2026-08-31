@@ -65,6 +65,10 @@ pub enum Format {
     /// Delimiter-separated text (`.csv`). Carries no signature, so it has to
     /// be named rather than detected.
     Csv,
+    /// HTML (`.html`, `.htm`, `.xhtml`). Like [`Format::Pdf`], converts to
+    /// Markdown directly with no document-model form; use
+    /// [`to_markdown_bytes`].
+    Html,
 }
 
 impl Format {
@@ -93,6 +97,7 @@ impl Format {
             "ods" => Format::Ods,
             "odp" => Format::Odp,
             "csv" => Format::Csv,
+            "html" | "htm" | "xhtml" => Format::Html,
             _ => return None,
         })
     }
@@ -118,6 +123,14 @@ pub fn to_markdown(path: impl AsRef<Path>) -> Result<String, ConvertError> {
             path.display()
         )));
     };
+    // HTML uses the file stem when the page carries no title of its own.
+    if format == Format::Html {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        return formats::html::to_markdown(&bytes, stem);
+    }
     to_markdown_bytes(&bytes, format)
 }
 
@@ -129,19 +142,21 @@ pub fn to_markdown_bytes(
     format: impl Into<Option<Format>>,
 ) -> Result<String, ConvertError> {
     let format = resolve_format(bytes, format.into())?;
-    // PDFs convert to Markdown directly (pdf-inspector) without passing
-    // through the document model.
-    if format == Format::Pdf {
-        return formats::pdf::to_markdown(bytes);
+    // PDFs and HTML convert to Markdown directly without passing through
+    // the document model.
+    match format {
+        Format::Pdf => formats::pdf::to_markdown(bytes),
+        Format::Html => formats::html::to_markdown(bytes, ""),
+        _ => Ok(document_to_markdown(&to_document(bytes, format)?)),
     }
-    Ok(document_to_markdown(&to_document(bytes, format)?))
 }
 
 /// Parse an in-memory document into the document model. Pass a [`Format`] to
 /// select the parser, or `None` to detect it from the content.
 ///
-/// Unsupported for [`Format::Pdf`]: PDF conversion produces Markdown
-/// directly and has no document-model form; use [`to_markdown_bytes`].
+/// Unsupported for [`Format::Pdf`] and [`Format::Html`]: both convert to
+/// Markdown directly and have no document-model form; use
+/// [`to_markdown_bytes`].
 pub fn to_document(
     bytes: &[u8],
     format: impl Into<Option<Format>>,

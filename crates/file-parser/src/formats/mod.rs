@@ -5,6 +5,7 @@ pub mod detect;
 mod doc;
 mod docx;
 mod epub;
+pub mod html;
 mod odf;
 pub mod pdf;
 mod ppt;
@@ -33,6 +34,11 @@ pub fn parse(bytes: &[u8], format: Format) -> Result<Document, ConvertError> {
         // model for PDFs. `to_markdown_bytes` routes them to `pdf`.
         Format::Pdf => Err(ConvertError::Unsupported(
             "PDF converts directly to Markdown; use to_markdown or to_markdown_bytes".to_string(),
+        )),
+        // HTML likewise emits Markdown directly; `to_markdown_bytes` routes
+        // it to `html`.
+        Format::Html => Err(ConvertError::Unsupported(
+            "HTML converts directly to Markdown; use to_markdown or to_markdown_bytes".to_string(),
         )),
     }
 }

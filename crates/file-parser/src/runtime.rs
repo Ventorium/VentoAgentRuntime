@@ -258,6 +258,7 @@ fn mime_for(file_name: &str) -> &'static str {
         "rtf" => "application/rtf",
         "epub" => "application/epub+zip",
         "csv" => "text/csv",
+        "html" | "htm" | "xhtml" => "text/html",
         "txt" | "md" | "mdx" | "json" | "yaml" | "yml" | "toml" | "xml" | "rs" | "ts" | "js"
         | "py" => "text/plain",
         "png" => "image/png",
@@ -468,6 +469,18 @@ impl FileParser {
             Format::Pdf => {
                 self.convert_pdf(bytes, file_name, ocr, context, images)
                     .await
+            }
+            // Direct-markdown path, like PDF but with no OCR fallback: HTML
+            // pages always carry extractable text.
+            Format::Html => {
+                let markdown = crate::formats::html::to_markdown(bytes, &file_stem(file_name))?;
+                context.decisions.push(Decision {
+                    target: file_name.to_owned(),
+                    action: "extract".into(),
+                    reason: "html tag conversion".into(),
+                    confidence: None,
+                });
+                Ok(markdown)
             }
             _ => {
                 let doc = crate::to_document(bytes, Some(format))?;
@@ -772,6 +785,7 @@ pub const SUPPORTED_FORMATS: &[(&str, &[&str])] = &[
         ],
     ),
     ("pdf", &["pdf"]),
+    ("html", &["html", "htm", "xhtml"]),
     (
         "image",
         &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"],

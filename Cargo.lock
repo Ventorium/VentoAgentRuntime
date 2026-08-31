@@ -2876,6 +2876,7 @@ dependencies = [
  "insta",
  "log",
  "quick-xml",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

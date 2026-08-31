@@ -15,6 +15,10 @@
 //!   designates as the main document (with the main part's mandated root
 //!   element as the authority when content types are stale or generic).
 //!
+//! - HTML: the `<!doctype html …>` declaration or `<html` root element
+//!   that opens the document (case-insensitive, after leading whitespace),
+//!   bounded at 1024 bytes.
+//!
 //! Plain-text formats (CSV) carry no signature and are never detected;
 //! callers fall back to the file extension. Detection never errors: any
 //! unreadable or ambiguous container yields `None` and the caller's
@@ -47,7 +51,28 @@ pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Format> {
     {
         return Some(Format::Pdf);
     }
+    if is_html(bytes) {
+        return Some(Format::Html);
+    }
     None
+}
+
+/// The HTML identity: after a UTF-8 BOM and leading whitespace, the
+/// document opens with the `<!doctype html …` declaration (HTML5 and the
+/// HTML 4/XHTML public variants all share the prefix) or the `<html` root
+/// element. Case-insensitive, bounded at 1024 bytes.
+fn is_html(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(1024)];
+    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let start = head
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(head.len());
+    let lower: Vec<u8> = head[start..]
+        .iter()
+        .map(|b| b.to_ascii_lowercase())
+        .collect();
+    lower.starts_with(b"<!doctype html") || lower.starts_with(b"<html")
 }
 
 /// Classify an OLE compound file by its mandated content stream. Encrypted
@@ -248,6 +273,33 @@ mod tests {
         assert_eq!(from_bytes(b"{\\rtf1\\ansi hi}"), Some(Format::Rtf));
         assert_eq!(from_bytes(b"a,b,c\n1,2,3\n"), None);
         assert_eq!(from_bytes(b""), None);
+    }
+
+    #[test]
+    fn html_doctype_and_root_element_are_identity() {
+        assert_eq!(
+            from_bytes(b"<!DOCTYPE html>\n<html></html>"),
+            Some(Format::Html)
+        );
+        assert_eq!(from_bytes(b"<html lang=\"en\"></html>"), Some(Format::Html));
+        // XHTML public doctype shares the `<!doctype html` prefix.
+        assert_eq!(
+            from_bytes(b"<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\">"),
+            Some(Format::Html)
+        );
+        // Leading whitespace, BOM, and case do not matter.
+        assert_eq!(from_bytes(b"\n  \t<HTML>"), Some(Format::Html));
+        assert_eq!(
+            from_bytes(b"\xEF\xBB\xBF<!doctype html>"),
+            Some(Format::Html)
+        );
+        // Other markup that merely contains tags is not HTML.
+        assert_eq!(from_bytes(b"<?xml version=\"1.0\"?><svg/>"), None);
+        assert_eq!(
+            from_bytes(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"),
+            None
+        );
+        assert_eq!(from_bytes(b"Plain text with <b>tags</b> inside."), None);
     }
 
     #[test]

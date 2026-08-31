@@ -1,0 +1,34 @@
+---
+source: crates/file-parser/tests/snapshots.rs
+expression: output
+---
+# Fixture Page
+
+# Fixture Page
+
+Hello **bold**, **also bold**, *italic*, and *also italic* text with an [link](https://example.com/docs).
+
+## Section
+
+Entities: a & b <c> "d" 'e'  f  2024
+
+    - Item 1
+
+    - Item 2
+
+    - First
+
+    | Name | Age |
+
+    | Alice | 30 |
+
+    | Bob | 25 |
+
+![A photo](photo.jpg)
+
+![](pic.png)
+
+---
+
+Line one
+Line two
