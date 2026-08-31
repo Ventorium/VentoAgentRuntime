@@ -1,6 +1,6 @@
 {
   "name": "@ventostack/vm-runtime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "N-API client for VentoAgentRuntime Firecracker sandboxes",
   "license": "MIT",
   "repository": {
@@ -10,8 +10,13 @@
   "type": "commonjs",
   "main": "index.js",
   "types": "index.d.ts",
-  "files": ["index.js", "index.d.ts"],
-  "publishConfig": {"access": "public"},
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "napi build --platform --release --manifest-path ../../bindings/vm-napi/Cargo.toml --output-dir .",
     "artifacts": "napi artifacts",
@@ -19,7 +24,9 @@
     "prepublishOnly": "napi prepublish -t npm --no-gh-release",
     "test": "bun test"
   },
-  "devDependencies": {"@napi-rs/cli": "3.4.1"},
+  "devDependencies": {
+    "@napi-rs/cli": "3.4.1"
+  },
   "napi": {
     "binaryName": "vento_vm_runtime",
     "targets": [

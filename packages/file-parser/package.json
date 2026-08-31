@@ -1,6 +1,6 @@
 {
   "name": "@ventostack/file-parser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Rust-native file parser converting enterprise documents to LLM Markdown",
   "license": "MIT",
   "repository": {
@@ -10,8 +10,13 @@
   "type": "commonjs",
   "main": "index.js",
   "types": "index.d.ts",
-  "files": ["index.js", "index.d.ts"],
-  "publishConfig": {"access": "public"},
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "napi build --platform --release --manifest-path ../../bindings/file-napi/Cargo.toml --output-dir .",
     "artifacts": "napi artifacts",
