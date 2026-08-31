@@ -70,6 +70,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             host: ubuntu-latest
             build-args: --use-napi-cross
+            # The napi-cross aarch64 gcc does not predefine __ARM_ARCH, which
+            # ring's pregenerated ARM asm requires; inject it manually.
+            cflags: -D__ARM_ARCH=8
           # musl targets cross-compile with the Zig toolchain.
           - target: x86_64-unknown-linux-musl
             host: ubuntu-latest
@@ -100,9 +103,13 @@ jobs:
       - name: Build file-parser
         working-directory: packages/file-parser
         run: npm run build -- --target ${{ matrix.settings.target }} ${{ matrix.settings.build-args || '' }}
+        env:
+          CFLAGS: ${{ matrix.settings.cflags }}
       - name: Build vm-runtime
         working-directory: packages/vm-runtime
         run: npm run build -- --target ${{ matrix.settings.target }} ${{ matrix.settings.build-args || '' }}
+        env:
+          CFLAGS: ${{ matrix.settings.cflags }}
       - uses: actions/upload-artifact@v4
         with:
           name: bindings-file-parser-${{ matrix.settings.target }}
