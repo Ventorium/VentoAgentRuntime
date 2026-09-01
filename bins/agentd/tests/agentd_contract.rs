@@ -36,16 +36,20 @@ fn exchange(requests: &[Value]) -> Vec<Value> {
 #[test]
 fn readiness_reports_protocol_version_and_invalid_json_is_structured() {
     let responses = exchange(&[json!({"method":"ready"})]);
-    assert_eq!(responses[0], json!({"result":"ready","data":{"version":1}}));
+    assert_eq!(responses[0], json!({"result":"ready","data":{"version":2}}));
 }
 
 #[test]
 fn command_executes_with_clean_environment_and_caller_variables() {
-    let responses = exchange(&[json!({"method":"run","params":{
-        "command":["/bin/sh","-c","printf '%s|%s' \"${INJECTED:-}\" \"${SHOULD_NOT_LEAK:-}\""],
-        "cwd":"/tmp","env":{"INJECTED":"allowed"},"timeoutMs":2000,"stdin":null
-    }})]);
-    let bytes = responses[0]["data"]["stdout"]
+    let responses = exchange(&[
+        json!({"method":"configure","params":{"env":{"BASE":"configured"},"max_processes":32768}}),
+        json!({"method":"run","params":{
+            "command":["/bin/sh","-c","printf '%s|%s' \"${INJECTED:-}\" \"${SHOULD_NOT_LEAK:-}\""],
+            "cwd":"/tmp","env":{"INJECTED":"allowed"},"timeoutMs":2000,"stdin":null
+        }}),
+    ]);
+    assert_eq!(responses[0]["result"], "empty");
+    let bytes = responses[1]["data"]["stdout"]
         .as_array()
         .unwrap()
         .iter()

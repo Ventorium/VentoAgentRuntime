@@ -16,13 +16,23 @@ use vento_vm_runtime::{BackendSnapshot, RuntimeError, SandboxBackend, SandboxBac
 pub struct FirecrackerConfig {
     pub firecracker_binary: PathBuf,
     pub jailer_binary: Option<PathBuf>,
+    #[serde(default = "default_jailer_id")]
+    pub jailer_uid: u32,
+    #[serde(default = "default_jailer_id")]
+    pub jailer_gid: u32,
     pub kernel_image: PathBuf,
     pub base_rootfs: PathBuf,
+    #[serde(default)]
+    pub template_rootfs: BTreeMap<String, PathBuf>,
     pub data_dir: PathBuf,
     #[serde(default = "default_agent_port")]
     pub agent_vsock_port: u32,
     #[serde(default = "default_boot_timeout")]
     pub boot_timeout_ms: u64,
+}
+
+fn default_jailer_id() -> u32 {
+    1000
 }
 
 fn default_agent_port() -> u32 {
@@ -48,6 +58,12 @@ impl FirecrackerFactory {
                 "local Firecracker runtime requires Linux".into(),
             ));
         }
+        if self.config.agent_vsock_port != default_agent_port() {
+            return Err(RuntimeError::Invalid(format!(
+                "agentVsockPort must be {} for the bundled agentd",
+                default_agent_port()
+            )));
+        }
         for (name, path) in [
             ("firecracker", self.config.firecracker_binary.as_path()),
             ("kernel", self.config.kernel_image.as_path()),
@@ -59,6 +75,17 @@ impl FirecrackerFactory {
                     path.display()
                 )));
             }
+        }
+        let Some(path) = &self.config.jailer_binary else {
+            return Err(RuntimeError::Invalid(
+                "jailerBinary is required for the Firecracker backend".into(),
+            ));
+        };
+        if !tokio::fs::try_exists(path).await.map_err(backend_error)? {
+            return Err(RuntimeError::Backend(format!(
+                "jailer does not exist: {}",
+                path.display()
+            )));
         }
         if !tokio::fs::try_exists("/dev/kvm")
             .await
@@ -81,24 +108,99 @@ impl SandboxBackendFactory for FirecrackerFactory {
         request: &CreateSandboxRequest,
     ) -> Result<Box<dyn SandboxBackend>, RuntimeError> {
         self.preflight().await?;
-        let sandbox_dir = self.config.data_dir.join("sandboxes").join(sandbox_id);
+        validate_supported_request(request)?;
+        let jailed = self.config.jailer_binary.is_some();
+        if request.snapshot_id.is_some() && !jailed {
+            return Err(RuntimeError::Invalid(
+                "snapshot restore requires jailer so device paths remain stable".into(),
+            ));
+        }
+        let sandbox_dir = if jailed {
+            let executable = self.config.firecracker_binary.file_name().ok_or_else(|| {
+                RuntimeError::Invalid("firecracker binary has no file name".into())
+            })?;
+            self.config
+                .data_dir
+                .join("jailer")
+                .join(executable)
+                .join(sandbox_id)
+                .join("root")
+        } else {
+            self.config.data_dir.join("sandboxes").join(sandbox_id)
+        };
         tokio::fs::create_dir_all(&sandbox_dir)
             .await
             .map_err(backend_error)?;
+        let source_rootfs = if request.template == "debian-slim" {
+            &self.config.base_rootfs
+        } else {
+            self.config
+                .template_rootfs
+                .get(&request.template)
+                .ok_or_else(|| {
+                    RuntimeError::Invalid(format!("unknown template: {}", request.template))
+                })?
+        };
         let rootfs = sandbox_dir.join("rootfs.ext4");
-        reflink_clone(&self.config.base_rootfs, &rootfs).await?;
+        reflink_clone(source_rootfs, &rootfs).await?;
+        resize_rootfs(&rootfs, request.resources.disk_mb).await?;
+        let kernel = sandbox_dir.join("kernel.bin");
+        reflink_clone(&self.config.kernel_image, &kernel).await?;
+        if jailed {
+            chown_for_jailer(&sandbox_dir, self.config.jailer_uid, self.config.jailer_gid)?;
+            chown_for_jailer(&rootfs, self.config.jailer_uid, self.config.jailer_gid)?;
+            chown_for_jailer(&kernel, self.config.jailer_uid, self.config.jailer_gid)?;
+        }
         let socket = sandbox_dir.join("firecracker.sock");
         let vsock = sandbox_dir.join("agent.vsock");
+        let paused_snapshot = if let Some(snapshot_id) = &request.snapshot_id {
+            let source = self.config.data_dir.join("snapshots").join(snapshot_id);
+            let restore = sandbox_dir.join("restore");
+            tokio::fs::create_dir_all(&restore)
+                .await
+                .map_err(backend_error)?;
+            let state = restore.join("vmstate.bin");
+            let memory = restore.join("memory.bin");
+            let snapshot_rootfs = restore.join("rootfs.ext4");
+            for (name, target) in [
+                ("vmstate.bin", &state),
+                ("memory.bin", &memory),
+                ("rootfs.ext4", &snapshot_rootfs),
+            ] {
+                reflink_clone(&source.join(name), target)
+                    .await
+                    .map_err(|_| {
+                        RuntimeError::Invalid(format!(
+                            "snapshot is unavailable or incomplete: {snapshot_id}"
+                        ))
+                    })?;
+            }
+            reflink_clone(&snapshot_rootfs, &rootfs).await?;
+            if jailed {
+                for path in [&restore, &state, &memory, &snapshot_rootfs, &rootfs] {
+                    chown_for_jailer(path, self.config.jailer_uid, self.config.jailer_gid)?;
+                }
+            }
+            Some(SnapshotPaths {
+                state,
+                memory,
+                rootfs: snapshot_rootfs,
+            })
+        } else {
+            None
+        };
         Ok(Box::new(FirecrackerBackend {
             config: self.config.clone(),
             request: request.clone(),
             sandbox_dir,
             rootfs,
+            kernel,
             socket,
             vsock,
             child: None,
-            paused_snapshot: None,
+            paused_snapshot,
             running: false,
+            jailed,
         }))
     }
 }
@@ -108,11 +210,13 @@ struct FirecrackerBackend {
     request: CreateSandboxRequest,
     sandbox_dir: PathBuf,
     rootfs: PathBuf,
+    kernel: PathBuf,
     socket: PathBuf,
     vsock: PathBuf,
     child: Option<Child>,
     paused_snapshot: Option<SnapshotPaths>,
     running: bool,
+    jailed: bool,
 }
 
 impl std::fmt::Debug for FirecrackerBackend {
@@ -153,6 +257,7 @@ impl SandboxBackend for FirecrackerBackend {
             let _ = tokio::fs::remove_dir_all(&self.sandbox_dir).await;
             return Err(error);
         }
+        self.bootstrap_agent().await?;
         self.running = true;
         Ok(())
     }
@@ -191,38 +296,57 @@ impl SandboxBackend for FirecrackerBackend {
 
     async fn run_command(
         &mut self,
-        _request: CommandRequest,
+        request: CommandRequest,
     ) -> Result<CommandResult, RuntimeError> {
-        Err(RuntimeError::Backend(format!(
-            "agentd transport is not ready on {}:{}",
-            self.vsock.display(),
-            self.config.agent_vsock_port
-        )))
+        match self
+            .agent_request(vento_agent_protocol::AgentRequest::Run(request))
+            .await?
+        {
+            vento_agent_protocol::AgentResponse::Command(result) => Ok(result),
+            response => Err(agent_response_error(response)),
+        }
     }
-    async fn kill_command(&mut self, _command_id: &str) -> Result<(), RuntimeError> {
-        Err(RuntimeError::Backend(
-            "agentd transport is not ready".into(),
-        ))
+    async fn kill_command(&mut self, command_id: &str) -> Result<(), RuntimeError> {
+        self.expect_empty(vento_agent_protocol::AgentRequest::Kill {
+            command_id: command_id.into(),
+        })
+        .await
     }
-    async fn read_file(&self, _path: &str, _max_bytes: u64) -> Result<Vec<u8>, RuntimeError> {
-        Err(RuntimeError::Backend(
-            "agentd transport is not ready".into(),
-        ))
+    async fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>, RuntimeError> {
+        match self
+            .agent_request(vento_agent_protocol::AgentRequest::ReadFile {
+                path: path.into(),
+                max_bytes,
+            })
+            .await?
+        {
+            vento_agent_protocol::AgentResponse::Bytes(bytes) => Ok(bytes),
+            response => Err(agent_response_error(response)),
+        }
     }
-    async fn write_file(&mut self, _path: &str, _data: &[u8]) -> Result<(), RuntimeError> {
-        Err(RuntimeError::Backend(
-            "agentd transport is not ready".into(),
-        ))
+    async fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), RuntimeError> {
+        self.expect_empty(vento_agent_protocol::AgentRequest::WriteFile {
+            path: path.into(),
+            data: data.into(),
+            mode: None,
+        })
+        .await
     }
-    async fn list_dir(&self, _path: &str) -> Result<Vec<FileEntry>, RuntimeError> {
-        Err(RuntimeError::Backend(
-            "agentd transport is not ready".into(),
-        ))
+    async fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, RuntimeError> {
+        match self
+            .agent_request(vento_agent_protocol::AgentRequest::ListDir { path: path.into() })
+            .await?
+        {
+            vento_agent_protocol::AgentResponse::Entries(entries) => Ok(entries),
+            response => Err(agent_response_error(response)),
+        }
     }
-    async fn remove(&mut self, _path: &str, _recursive: bool) -> Result<(), RuntimeError> {
-        Err(RuntimeError::Backend(
-            "agentd transport is not ready".into(),
-        ))
+    async fn remove(&mut self, path: &str, recursive: bool) -> Result<(), RuntimeError> {
+        self.expect_empty(vento_agent_protocol::AgentRequest::Remove {
+            path: path.into(),
+            recursive,
+        })
+        .await
     }
 
     async fn snapshot(&mut self, snapshot_id: &str) -> Result<BackendSnapshot, RuntimeError> {
@@ -231,25 +355,97 @@ impl SandboxBackend for FirecrackerBackend {
                 "persistent snapshot requires a running sandbox".into(),
             ));
         }
-        let directory = self.config.data_dir.join("snapshots").join(snapshot_id);
+        let directory = self.sandbox_dir.join("snapshots").join(snapshot_id);
         let snapshot = self.capture_to(&directory).await?;
         self.load_snapshot(&snapshot).await?;
         let size_bytes = file_size(&snapshot.state).await?
             + file_size(&snapshot.memory).await?
             + file_size(&snapshot.rootfs).await?;
+        let persistent = self.config.data_dir.join("snapshots").join(snapshot_id);
+        tokio::fs::create_dir_all(&persistent)
+            .await
+            .map_err(backend_error)?;
+        for (source, name) in [
+            (&snapshot.state, "vmstate.bin"),
+            (&snapshot.memory, "memory.bin"),
+            (&snapshot.rootfs, "rootfs.ext4"),
+        ] {
+            reflink_clone(source, &persistent.join(name)).await?;
+        }
         Ok(BackendSnapshot { size_bytes })
     }
 }
 
 impl FirecrackerBackend {
+    async fn agent_request(
+        &self,
+        request: vento_agent_protocol::AgentRequest,
+    ) -> Result<vento_agent_protocol::AgentResponse, RuntimeError> {
+        let mut stream = tokio::net::UnixStream::connect(&self.vsock)
+            .await
+            .map_err(backend_error)?;
+        stream
+            .write_all(format!("CONNECT {}\n", self.config.agent_vsock_port).as_bytes())
+            .await
+            .map_err(backend_error)?;
+        let mut handshake = Vec::new();
+        read_line_capped(&mut stream, &mut handshake, 128).await?;
+        if !handshake.starts_with(b"OK ") {
+            return Err(RuntimeError::Backend(format!(
+                "vsock handshake failed: {}",
+                String::from_utf8_lossy(&handshake)
+            )));
+        }
+        let mut frame =
+            serde_json::to_vec(&request).map_err(|e| RuntimeError::Backend(e.to_string()))?;
+        frame.push(b'\n');
+        stream.write_all(&frame).await.map_err(backend_error)?;
+        let mut response = Vec::new();
+        read_line_capped(
+            &mut stream,
+            &mut response,
+            vento_agent_protocol::MAX_FRAME_BYTES,
+        )
+        .await?;
+        serde_json::from_slice(&response)
+            .map_err(|e| RuntimeError::Backend(format!("invalid agent response: {e}")))
+    }
+
+    async fn expect_empty(
+        &self,
+        request: vento_agent_protocol::AgentRequest,
+    ) -> Result<(), RuntimeError> {
+        match self.agent_request(request).await? {
+            vento_agent_protocol::AgentResponse::Empty => Ok(()),
+            response => Err(agent_response_error(response)),
+        }
+    }
+
     async fn spawn(&mut self) -> Result<(), RuntimeError> {
         let _ = tokio::fs::remove_file(&self.socket).await;
-        let child = Command::new(&self.config.firecracker_binary)
-            .arg("--api-sock")
-            .arg(&self.socket)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(backend_error)?;
+        let mut command = if let Some(jailer) = &self.config.jailer_binary {
+            let mut command = Command::new(jailer);
+            command
+                .args(["--id", self.sandbox_id()?])
+                .arg("--exec-file")
+                .arg(&self.config.firecracker_binary)
+                .args([
+                    "--uid",
+                    &self.config.jailer_uid.to_string(),
+                    "--gid",
+                    &self.config.jailer_gid.to_string(),
+                ])
+                .arg("--chroot-base-dir")
+                .arg(self.config.data_dir.join("jailer"))
+                .arg("--")
+                .args(["--api-sock", "/firecracker.sock"]);
+            command
+        } else {
+            let mut command = Command::new(&self.config.firecracker_binary);
+            command.arg("--api-sock").arg(&self.socket);
+            command
+        };
+        let child = command.kill_on_drop(true).spawn().map_err(backend_error)?;
         self.child = Some(child);
         let deadline = Instant::now() + Duration::from_millis(self.config.boot_timeout_ms);
         while Instant::now() < deadline {
@@ -268,6 +464,9 @@ impl FirecrackerBackend {
     }
 
     async fn configure_fresh(&self) -> Result<(), RuntimeError> {
+        let kernel = self.fc_path(&self.kernel);
+        let rootfs = self.fc_path(&self.rootfs);
+        let vsock = self.fc_path(&self.vsock);
         firecracker_put(
             &self.socket,
             "/machine-config",
@@ -282,7 +481,7 @@ impl FirecrackerBackend {
             &self.socket,
             "/boot-source",
             &serde_json::json!({
-                "kernel_image_path": self.config.kernel_image,
+                "kernel_image_path": kernel,
                 "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/agentd",
             }),
         )
@@ -291,7 +490,7 @@ impl FirecrackerBackend {
             &self.socket,
             "/drives/rootfs",
             &serde_json::json!({
-                "drive_id": "rootfs", "path_on_host": self.rootfs,
+                "drive_id": "rootfs", "path_on_host": rootfs,
                 "is_root_device": true, "is_read_only": false,
             }),
         )
@@ -300,7 +499,7 @@ impl FirecrackerBackend {
             &self.socket,
             "/vsock",
             &serde_json::json!({
-                "guest_cid": guest_cid(&self.sandbox_dir), "uds_path": self.vsock,
+                "guest_cid": guest_cid(&self.sandbox_dir), "uds_path": vsock,
             }),
         )
         .await?;
@@ -316,6 +515,9 @@ impl FirecrackerBackend {
         tokio::fs::create_dir_all(directory)
             .await
             .map_err(backend_error)?;
+        if self.jailed {
+            chown_for_jailer(directory, self.config.jailer_uid, self.config.jailer_gid)?;
+        }
         firecracker_patch(&self.socket, "/vm", &serde_json::json!({"state":"Paused"})).await?;
         let state = directory.join("vmstate.bin");
         let memory = directory.join("memory.bin");
@@ -325,7 +527,7 @@ impl FirecrackerBackend {
             &self.socket,
             "/snapshot/create",
             &serde_json::json!({
-                "snapshot_type": "Full", "snapshot_path": state, "mem_file_path": memory,
+                "snapshot_type": "Full", "snapshot_path": self.fc_path(&state), "mem_file_path": self.fc_path(&memory),
             }),
         )
         .await?;
@@ -342,8 +544,8 @@ impl FirecrackerBackend {
             &self.socket,
             "/snapshot/load",
             &serde_json::json!({
-                "snapshot_path": snapshot.state,
-                "mem_backend": {"backend_type":"File", "backend_path": snapshot.memory},
+                "snapshot_path": self.fc_path(&snapshot.state),
+                "mem_backend": {"backend_type":"File", "backend_path": self.fc_path(&snapshot.memory)},
                 "enable_diff_snapshots": true,
                 "resume_vm": true,
             }),
@@ -358,6 +560,97 @@ impl FirecrackerBackend {
         }
         let _ = tokio::fs::remove_file(&self.socket).await;
         Ok(())
+    }
+
+    fn fc_path(&self, path: &Path) -> PathBuf {
+        if self.jailed {
+            PathBuf::from("/").join(path.strip_prefix(&self.sandbox_dir).unwrap_or(path))
+        } else {
+            path.to_owned()
+        }
+    }
+
+    fn sandbox_id(&self) -> Result<&str, RuntimeError> {
+        self.sandbox_dir
+            .ancestors()
+            .nth(1)
+            .and_then(Path::file_name)
+            .and_then(|v| v.to_str())
+            .ok_or_else(|| RuntimeError::Backend("invalid jail sandbox path".into()))
+    }
+
+    async fn bootstrap_agent(&self) -> Result<(), RuntimeError> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.boot_timeout_ms);
+        loop {
+            match self
+                .agent_request(vento_agent_protocol::AgentRequest::Ready)
+                .await
+            {
+                Ok(vento_agent_protocol::AgentResponse::Ready { version })
+                    if version == vento_agent_protocol::PROTOCOL_VERSION =>
+                {
+                    break;
+                }
+                _ if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await
+                }
+                other => {
+                    return Err(RuntimeError::Backend(format!(
+                        "agentd did not become ready: {other:?}"
+                    )));
+                }
+            }
+        }
+        let mut env = self.request.env.clone();
+        env.extend(self.request.secrets.clone());
+        self.expect_empty(vento_agent_protocol::AgentRequest::Configure {
+            env,
+            max_processes: self.request.resources.max_processes,
+        })
+        .await
+    }
+}
+
+fn validate_supported_request(request: &CreateSandboxRequest) -> Result<(), RuntimeError> {
+    if request.knowledge.is_some() {
+        return Err(RuntimeError::Invalid(
+            "knowledge storage is not configured yet".into(),
+        ));
+    }
+    if !request.network.deny_private_network
+        || !request.network.allow_cidrs.is_empty()
+        || !request.network.allow_domains.is_empty()
+    {
+        return Err(RuntimeError::Invalid(
+            "network access is disabled; allow rules require a configured network backend".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_response_error(response: vento_agent_protocol::AgentResponse) -> RuntimeError {
+    match response {
+        vento_agent_protocol::AgentResponse::Error { code, message } => {
+            RuntimeError::Backend(format!("agent {code}: {message}"))
+        }
+        other => RuntimeError::Backend(format!("unexpected agent response: {other:?}")),
+    }
+}
+
+async fn read_line_capped(
+    stream: &mut tokio::net::UnixStream,
+    output: &mut Vec<u8>,
+    cap: usize,
+) -> Result<(), RuntimeError> {
+    loop {
+        if output.len() >= cap {
+            return Err(RuntimeError::Backend("agent frame exceeds limit".into()));
+        }
+        let byte = stream.read_u8().await.map_err(backend_error)?;
+        if byte == b'\n' {
+            return Ok(());
+        }
+        output.push(byte);
     }
 }
 
@@ -429,6 +722,51 @@ async fn probe_reflink(directory: &Path) -> Result<(), RuntimeError> {
     })
 }
 
+async fn resize_rootfs(path: &Path, disk_mb: u32) -> Result<(), RuntimeError> {
+    let requested = u64::from(disk_mb) * 1024 * 1024;
+    let current = tokio::fs::metadata(path)
+        .await
+        .map_err(backend_error)?
+        .len();
+    if requested < current {
+        return Err(RuntimeError::Invalid(format!(
+            "diskMB is smaller than the {} MiB base image",
+            current.div_ceil(1024 * 1024)
+        )));
+    }
+    if requested == current {
+        return Ok(());
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(backend_error)?;
+    file.set_len(requested).await.map_err(backend_error)?;
+    let status = Command::new("resize2fs")
+        .arg(path)
+        .status()
+        .await
+        .map_err(|error| {
+            RuntimeError::Backend(format!("resize2fs is required to enforce diskMB: {error}"))
+        })?;
+    if !status.success() {
+        return Err(RuntimeError::Backend(format!(
+            "resize2fs failed with {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn chown_for_jailer(path: &Path, uid: u32, gid: u32) -> Result<(), RuntimeError> {
+    nix::unistd::chown(
+        path,
+        Some(nix::unistd::Uid::from_raw(uid)),
+        Some(nix::unistd::Gid::from_raw(gid)),
+    )
+    .map_err(|error| RuntimeError::Backend(error.to_string()))
+}
+
 async fn reflink_clone(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
     let _ = tokio::fs::remove_file(destination).await;
     let output = Command::new("cp")
@@ -485,14 +823,35 @@ mod tests {
         assert!(guest_cid(Path::new("sandbox")) >= 3);
     }
 
+    #[test]
+    fn unsupported_security_policies_fail_closed() {
+        let mut request = CreateSandboxRequest::default();
+        request.network.deny_private_network = false;
+        assert!(validate_supported_request(&request).is_err());
+
+        let request = CreateSandboxRequest {
+            knowledge: Some(vento_runtime_types::KnowledgeMount {
+                bucket: "documents".into(),
+                prefix: "tenant".into(),
+                version: "v1".into(),
+                mount_path: "/knowledge".into(),
+            }),
+            ..CreateSandboxRequest::default()
+        };
+        assert!(validate_supported_request(&request).is_err());
+    }
+
     #[tokio::test]
     async fn preflight_rejects_missing_runtime_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let factory = FirecrackerFactory::new(FirecrackerConfig {
             firecracker_binary: temp.path().join("missing-firecracker"),
             jailer_binary: None,
+            jailer_uid: default_jailer_id(),
+            jailer_gid: default_jailer_id(),
             kernel_image: temp.path().join("missing-kernel"),
             base_rootfs: temp.path().join("missing-rootfs"),
+            template_rootfs: BTreeMap::new(),
             data_dir: temp.path().join("data"),
             agent_vsock_port: default_agent_port(),
             boot_timeout_ms: default_boot_timeout(),

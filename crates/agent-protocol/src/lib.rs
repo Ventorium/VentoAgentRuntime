@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: MIT
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use vento_runtime_types::{CommandRequest, CommandResult, FileEntry};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AgentRequest {
     Ready,
+    Configure {
+        env: BTreeMap<String, String>,
+        max_processes: u32,
+    },
     Run(CommandRequest),
     Kill {
         command_id: String,

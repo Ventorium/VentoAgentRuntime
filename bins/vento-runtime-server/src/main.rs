@@ -24,6 +24,8 @@ struct Cli {
     token: String,
     #[arg(long)]
     firecracker_config: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 5_000)]
+    reap_interval_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -48,12 +50,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime: VmRuntime::new(factory),
         token: Arc::from(cli.token),
     };
+    let reaper = spawn_reaper(state.runtime.clone(), cli.reap_interval_ms);
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    reaper.abort();
     Ok(())
+}
+
+fn spawn_reaper(runtime: VmRuntime, interval_ms: u64) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_millis(interval_ms.max(100)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            runtime.reap_idle(vento_runtime_types::now_ms()).await;
+        }
+    })
 }
 
 fn build_app(state: AppState) -> Router {
@@ -319,6 +335,21 @@ mod tests {
             runtime: VmRuntime::new(Arc::new(InMemoryBackendFactory)),
             token: Arc::from(TOKEN),
         })
+    }
+
+    #[tokio::test]
+    async fn background_reaper_enforces_expiration() {
+        let runtime = VmRuntime::new(Arc::new(InMemoryBackendFactory));
+        let request = CreateSandboxRequest {
+            timeout_seconds: 1,
+            idle_action: vento_runtime_types::IdleAction::Destroy,
+            ..CreateSandboxRequest::default()
+        };
+        let sandbox = runtime.create(request, None).await.expect("create");
+        let task = spawn_reaper(runtime.clone(), 100);
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        task.abort();
+        assert!(runtime.get(&sandbox.sandbox_id).await.is_err());
     }
 
     fn request(method: &str, uri: &str, body: Body) -> Request<Body> {

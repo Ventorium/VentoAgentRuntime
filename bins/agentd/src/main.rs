@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, Write};
+use std::sync::{LazyLock, RwLock};
 use std::time::Instant;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -9,6 +12,13 @@ use vento_runtime_types::{CommandResult, FileEntry, new_id, now_ms};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prepare_directories().await?;
+    if std::env::var_os("VENTO_AGENTD_SKIP_PREPARE").is_none() && cfg!(target_os = "linux") {
+        return serve_vsock().await;
+    }
+    serve_stdio().await
+}
+
+async fn serve_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = tokio::io::stdout();
@@ -32,6 +42,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn serve_vsock() -> Result<(), Box<dyn std::error::Error>> {
+    const PORT: u32 = 10_000;
+    let listener = vsock::VsockListener::bind_with_cid_port(vsock::VMADDR_CID_ANY, PORT)?;
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        loop {
+            let (mut stream, _) = listener.accept().map_err(std::io::Error::other)?;
+            let runtime = runtime.clone();
+            std::thread::spawn(move || {
+                let reader_stream = match stream.try_clone() {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let mut reader = std::io::BufReader::new(reader_stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err()
+                    || line.len() > vento_agent_protocol::MAX_FRAME_BYTES
+                {
+                    return;
+                }
+                let response = match serde_json::from_str::<AgentRequest>(line.trim_end()) {
+                    Ok(request) => runtime.block_on(handle(request)),
+                    Err(error) => AgentResponse::Error {
+                        code: "INVALID_REQUEST".into(),
+                        message: error.to_string(),
+                    },
+                };
+                if let Ok(mut bytes) = serde_json::to_vec(&response) {
+                    bytes.push(b'\n');
+                    let _ = stream.write_all(&bytes);
+                }
+            });
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 async fn prepare_directories() -> std::io::Result<()> {
     #[cfg(debug_assertions)]
     if std::env::var_os("VENTO_AGENTD_SKIP_PREPARE").is_some() {
@@ -48,6 +96,23 @@ async fn handle(request: AgentRequest) -> AgentResponse {
         AgentRequest::Ready => AgentResponse::Ready {
             version: PROTOCOL_VERSION,
         },
+        AgentRequest::Configure { env, max_processes } => {
+            #[cfg(target_os = "linux")]
+            if let Err(error) = nix::sys::resource::setrlimit(
+                nix::sys::resource::Resource::RLIMIT_NPROC,
+                max_processes.into(),
+                max_processes.into(),
+            ) {
+                return AgentResponse::Error {
+                    code: "RESOURCE_LIMIT".into(),
+                    message: error.to_string(),
+                };
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = max_processes;
+            *BASE_ENV.write().expect("base env lock") = env;
+            AgentResponse::Empty
+        }
         AgentRequest::Run(request) => run(request).await,
         AgentRequest::ReadFile { path, max_bytes } => match read_file(&path, max_bytes).await {
             Ok(data) => AgentResponse::Bytes(data),
@@ -103,10 +168,25 @@ async fn handle(request: AgentRequest) -> AgentResponse {
                 Err(error) => agent_error(error),
             }
         }
-        AgentRequest::Kill { .. } => AgentResponse::Error {
-            code: "NOT_IMPLEMENTED".into(),
-            message: "process registry is not enabled".into(),
-        },
+        AgentRequest::Kill { command_id } => {
+            let pid = RUNNING_COMMANDS.lock().await.get(&command_id).copied();
+            match pid {
+                Some(pid) => match nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid.cast_signed()),
+                    nix::sys::signal::Signal::SIGKILL,
+                ) {
+                    Ok(()) => AgentResponse::Empty,
+                    Err(error) => AgentResponse::Error {
+                        code: "KILL_FAILED".into(),
+                        message: error.to_string(),
+                    },
+                },
+                None => AgentResponse::Error {
+                    code: "COMMAND_NOT_FOUND".into(),
+                    message: "command is not running".into(),
+                },
+            }
+        }
         AgentRequest::Shutdown => AgentResponse::Empty,
     }
 }
@@ -129,21 +209,28 @@ async fn run(request: vento_runtime_types::CommandRequest) -> AgentResponse {
     if request.stdin.is_some() {
         command.stdin(std::process::Stdio::piped());
     }
+    let base_env = BASE_ENV.read().expect("base env lock").clone();
     command
         .args(&request.command[1..])
         .current_dir(request.cwd)
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("HOME", "/home")
+        .envs(base_env)
         .envs(request.env)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let input = request.stdin;
+    let command_id = new_id("cmd");
+    let registry_id = command_id.clone();
     let outcome = tokio::time::timeout(
         std::time::Duration::from_millis(request.timeout_ms),
         async {
             let mut child = command.spawn()?;
+            if let Some(pid) = child.id() {
+                RUNNING_COMMANDS.lock().await.insert(registry_id, pid);
+            }
             if let Some(input) = input
                 && let Some(mut stdin) = child.stdin.take()
             {
@@ -153,6 +240,7 @@ async fn run(request: vento_runtime_types::CommandRequest) -> AgentResponse {
         },
     )
     .await;
+    RUNNING_COMMANDS.lock().await.remove(&command_id);
     let (exit_code, stdout, stderr, timed_out) = match outcome {
         Ok(Ok(output)) => (
             output.status.code(),
@@ -164,7 +252,7 @@ async fn run(request: vento_runtime_types::CommandRequest) -> AgentResponse {
         Err(_) => (None, Vec::new(), b"command timed out".to_vec(), true),
     };
     AgentResponse::Command(CommandResult {
-        command_id: new_id("cmd"),
+        command_id,
         exit_code,
         stdout,
         stderr,
@@ -172,6 +260,11 @@ async fn run(request: vento_runtime_types::CommandRequest) -> AgentResponse {
         timed_out,
     })
 }
+
+static BASE_ENV: LazyLock<RwLock<BTreeMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(BTreeMap::new()));
+static RUNNING_COMMANDS: LazyLock<tokio::sync::Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 fn truncate(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.truncate(1024 * 1024);

@@ -53,6 +53,7 @@ tower-http = { version = "=0.6.8", features = ["limit", "request-id", "trace"] }
 ttf-parser = "=0.25.1"
 unicode-normalization = "=0.1.25"
 uuid = { version = "=1.23.0", features = ["serde", "v7"] }
+vsock = "=0.5.4"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
