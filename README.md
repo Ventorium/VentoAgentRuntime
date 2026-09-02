@@ -45,3 +45,6 @@ protocol changes. A minimal Firecracker configuration is:
 The host also needs `resize2fs` when a sandbox requests a disk larger than its template.
 Networking is fail-closed: guests receive no network interface. Requests that ask to allow
 network access, or request a knowledge mount without a configured storage backend, are rejected.
+
+The validated VM 105 deployment, systemd configuration, acceptance gate and recovery notes are
+documented in [docs/remote-agent-runtime.md](docs/remote-agent-runtime.md).

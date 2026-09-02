@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use vento_runtime_types::{CommandRequest, CommandResult, CreateSandboxRequest, FileEntry};
+use vento_runtime_types::{
+    CommandRequest, CommandResult, CreateSandboxRequest, FileEntry, SandboxState,
+};
 use vento_vm_runtime::{BackendSnapshot, RuntimeError, SandboxBackend, SandboxBackendFactory};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +100,23 @@ impl FirecrackerFactory {
             .map_err(backend_error)?;
         probe_reflink(&self.config.data_dir).await
     }
+
+    fn sandbox_dir(&self, sandbox_id: &str) -> Result<PathBuf, RuntimeError> {
+        if self.config.jailer_binary.is_some() {
+            let executable = self.config.firecracker_binary.file_name().ok_or_else(|| {
+                RuntimeError::Invalid("firecracker binary has no file name".into())
+            })?;
+            Ok(self
+                .config
+                .data_dir
+                .join("jailer")
+                .join(executable)
+                .join(jailer_id(sandbox_id))
+                .join("root"))
+        } else {
+            Ok(self.config.data_dir.join("sandboxes").join(sandbox_id))
+        }
+    }
 }
 
 #[async_trait]
@@ -115,19 +134,7 @@ impl SandboxBackendFactory for FirecrackerFactory {
                 "snapshot restore requires jailer so device paths remain stable".into(),
             ));
         }
-        let sandbox_dir = if jailed {
-            let executable = self.config.firecracker_binary.file_name().ok_or_else(|| {
-                RuntimeError::Invalid("firecracker binary has no file name".into())
-            })?;
-            self.config
-                .data_dir
-                .join("jailer")
-                .join(executable)
-                .join(sandbox_id)
-                .join("root")
-        } else {
-            self.config.data_dir.join("sandboxes").join(sandbox_id)
-        };
+        let sandbox_dir = self.sandbox_dir(sandbox_id)?;
         tokio::fs::create_dir_all(&sandbox_dir)
             .await
             .map_err(backend_error)?;
@@ -202,6 +209,73 @@ impl SandboxBackendFactory for FirecrackerFactory {
             running: false,
             jailed,
         }))
+    }
+
+    async fn recover(
+        &self,
+        sandbox_id: &str,
+        request: &CreateSandboxRequest,
+        state: SandboxState,
+    ) -> Result<Box<dyn SandboxBackend>, RuntimeError> {
+        self.preflight().await?;
+        validate_supported_request(request)?;
+        let sandbox_dir = self.sandbox_dir(sandbox_id)?;
+        let rootfs = sandbox_dir.join("rootfs.ext4");
+        let kernel = sandbox_dir.join("kernel.bin");
+        for (name, path) in [("sandbox rootfs", &rootfs), ("sandbox kernel", &kernel)] {
+            if !tokio::fs::try_exists(path).await.map_err(backend_error)? {
+                return Err(RuntimeError::Backend(format!(
+                    "cannot recover {sandbox_id}: {name} is missing at {}",
+                    path.display()
+                )));
+            }
+        }
+        let paused_directory = sandbox_dir.join("paused");
+        let paused_candidate = SnapshotPaths {
+            state: paused_directory.join("vmstate.bin"),
+            memory: paused_directory.join("memory.bin"),
+            rootfs: paused_directory.join("rootfs.ext4"),
+        };
+        let has_paused_snapshot = tokio::fs::try_exists(&paused_candidate.state)
+            .await
+            .map_err(backend_error)?
+            && tokio::fs::try_exists(&paused_candidate.memory)
+                .await
+                .map_err(backend_error)?
+            && tokio::fs::try_exists(&paused_candidate.rootfs)
+                .await
+                .map_err(backend_error)?;
+        let paused_snapshot = if state == SandboxState::Paused || has_paused_snapshot {
+            let snapshot = paused_candidate;
+            for path in [&snapshot.state, &snapshot.memory, &snapshot.rootfs] {
+                if !tokio::fs::try_exists(path).await.map_err(backend_error)? {
+                    return Err(RuntimeError::Backend(format!(
+                        "cannot recover paused sandbox {sandbox_id}: {} is missing",
+                        path.display()
+                    )));
+                }
+            }
+            Some(snapshot)
+        } else {
+            None
+        };
+        let mut backend = FirecrackerBackend {
+            config: self.config.clone(),
+            request: request.clone(),
+            socket: sandbox_dir.join("firecracker.sock"),
+            vsock: sandbox_dir.join("agent.vsock"),
+            sandbox_dir,
+            rootfs,
+            kernel,
+            child: None,
+            paused_snapshot,
+            running: false,
+            jailed: self.config.jailer_binary.is_some(),
+        };
+        if state == SandboxState::Running {
+            backend.start().await?;
+        }
+        Ok(Box::new(backend))
     }
 }
 
@@ -357,7 +431,7 @@ impl SandboxBackend for FirecrackerBackend {
         }
         let directory = self.sandbox_dir.join("snapshots").join(snapshot_id);
         let snapshot = self.capture_to(&directory).await?;
-        self.load_snapshot(&snapshot).await?;
+        firecracker_patch(&self.socket, "/vm", &serde_json::json!({"state":"Resumed"})).await?;
         let size_bytes = file_size(&snapshot.state).await?
             + file_size(&snapshot.memory).await?
             + file_size(&snapshot.rootfs).await?;
@@ -424,6 +498,7 @@ impl FirecrackerBackend {
     async fn spawn(&mut self) -> Result<(), RuntimeError> {
         let _ = tokio::fs::remove_file(&self.socket).await;
         let mut command = if let Some(jailer) = &self.config.jailer_binary {
+            clean_jailer_runtime_files(&self.sandbox_dir).await?;
             let mut command = Command::new(jailer);
             command
                 .args(["--id", self.sandbox_id()?])
@@ -512,6 +587,8 @@ impl FirecrackerBackend {
     }
 
     async fn capture_to(&self, directory: &Path) -> Result<SnapshotPaths, RuntimeError> {
+        self.expect_empty(vento_agent_protocol::AgentRequest::Sync)
+            .await?;
         tokio::fs::create_dir_all(directory)
             .await
             .map_err(backend_error)?;
@@ -540,6 +617,9 @@ impl FirecrackerBackend {
 
     async fn load_snapshot(&mut self, snapshot: &SnapshotPaths) -> Result<(), RuntimeError> {
         reflink_clone(&snapshot.rootfs, &self.rootfs).await?;
+        if self.jailed {
+            chown_for_jailer(&self.rootfs, self.config.jailer_uid, self.config.jailer_gid)?;
+        }
         firecracker_put(
             &self.socket,
             "/snapshot/load",
@@ -609,6 +689,29 @@ impl FirecrackerBackend {
         })
         .await
     }
+}
+
+async fn clean_jailer_runtime_files(sandbox_dir: &Path) -> Result<(), RuntimeError> {
+    for directory in ["dev", "run"] {
+        match tokio::fs::remove_dir_all(sandbox_dir.join(directory)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(backend_error(error)),
+        }
+    }
+    for file in [
+        "firecracker",
+        "firecracker.pid",
+        "firecracker.sock",
+        "agent.vsock",
+    ] {
+        match tokio::fs::remove_file(sandbox_dir.join(file)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(backend_error(error)),
+        }
+    }
+    Ok(())
 }
 
 fn validate_supported_request(request: &CreateSandboxRequest) -> Result<(), RuntimeError> {
@@ -688,12 +791,15 @@ async fn firecracker_request(
         .await
         .map_err(backend_error)?;
     stream.write_all(&body).await.map_err(backend_error)?;
-    stream.shutdown().await.map_err(backend_error)?;
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(backend_error)?;
+    while !response.ends_with(b"\r\n\r\n") {
+        if response.len() >= 16 * 1024 {
+            return Err(RuntimeError::Backend(
+                "Firecracker response headers exceed 16 KiB".into(),
+            ));
+        }
+        response.push(stream.read_u8().await.map_err(backend_error)?);
+    }
     let status = String::from_utf8_lossy(&response)
         .lines()
         .next()
@@ -804,6 +910,19 @@ fn guest_cid(path: &Path) -> u32 {
     3 + hash % (u32::MAX - 3)
 }
 
+fn jailer_id(sandbox_id: &str) -> String {
+    sandbox_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 #[allow(dead_code)]
 fn default_private_denies() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
@@ -821,6 +940,16 @@ mod tests {
     #[test]
     fn guest_cid_is_not_reserved() {
         assert!(guest_cid(Path::new("sandbox")) >= 3);
+    }
+
+    #[test]
+    fn runtime_id_is_mapped_to_a_valid_jailer_id() {
+        assert_eq!(jailer_id("sbx_019ff8a6"), "sbx-019ff8a6");
+        assert!(
+            jailer_id("sbx_019ff8a6")
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        );
     }
 
     #[test]
@@ -862,6 +991,89 @@ mod tests {
             assert!(message.contains("firecracker does not exist"));
         } else {
             assert!(message.contains("requires Linux"));
+        }
+    }
+
+    #[tokio::test]
+    async fn firecracker_request_keeps_connection_open_for_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("firecracker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            let headers = String::from_utf8(request).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), stream.read_u8())
+                    .await
+                    .is_err(),
+                "client closed its write half before reading the response"
+            );
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            firecracker_put(&socket, "/machine-config", &serde_json::json!({})),
+        )
+        .await
+        .expect("client waited for the server to close the connection")
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn jailer_restart_removes_only_transient_chroot_files() {
+        let temp = tempfile::tempdir().unwrap();
+        for directory in ["dev/net", "run", "paused"] {
+            tokio::fs::create_dir_all(temp.path().join(directory))
+                .await
+                .unwrap();
+        }
+        for file in [
+            "dev/net/tun",
+            "firecracker",
+            "firecracker.pid",
+            "firecracker.sock",
+            "agent.vsock",
+            "rootfs.ext4",
+            "kernel.bin",
+            "paused/vmstate.bin",
+        ] {
+            tokio::fs::write(temp.path().join(file), b"fixture")
+                .await
+                .unwrap();
+        }
+
+        clean_jailer_runtime_files(temp.path()).await.unwrap();
+
+        for removed in [
+            "dev",
+            "run",
+            "firecracker",
+            "firecracker.pid",
+            "firecracker.sock",
+            "agent.vsock",
+        ] {
+            assert!(!temp.path().join(removed).exists(), "{removed} remains");
+        }
+        for preserved in ["rootfs.ext4", "kernel.bin", "paused/vmstate.bin"] {
+            assert!(temp.path().join(preserved).exists(), "{preserved} removed");
         }
     }
 

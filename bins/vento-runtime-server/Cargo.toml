@@ -18,4 +18,5 @@ vento-runtime-types = { path = "../../crates/runtime-types" }
 vento-vm-runtime = { path = "../../crates/vm-runtime" }
 
 [dev-dependencies]
+tempfile.workspace = true
 tower = "=0.5.3"

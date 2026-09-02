@@ -40,21 +40,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.token.len() < 24 {
         return Err("runtime token must contain at least 24 characters".into());
     }
-    let factory: Arc<dyn SandboxBackendFactory> = if let Some(path) = cli.firecracker_config {
-        let config: FirecrackerConfig = serde_json::from_slice(&tokio::fs::read(path).await?)?;
-        Arc::new(FirecrackerFactory::new(config))
-    } else {
-        Arc::new(InMemoryBackendFactory)
+    let (factory, state_path): (Arc<dyn SandboxBackendFactory>, Option<std::path::PathBuf>) =
+        if let Some(path) = cli.firecracker_config {
+            let config: FirecrackerConfig = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+            let state_path = config.data_dir.join("control-plane.json");
+            (Arc::new(FirecrackerFactory::new(config)), Some(state_path))
+        } else {
+            (Arc::new(InMemoryBackendFactory), None)
+        };
+    let runtime = match state_path {
+        Some(path) => VmRuntime::new_persistent(factory, path).await?,
+        None => VmRuntime::new(factory),
     };
     let state = AppState {
-        runtime: VmRuntime::new(factory),
+        runtime,
         token: Arc::from(cli.token),
     };
     let reaper = spawn_reaper(state.runtime.clone(), cli.reap_interval_ms);
+    let shutdown_runtime = state.runtime.clone();
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_runtime))
         .await?;
     reaper.abort();
     Ok(())
@@ -97,8 +104,22 @@ fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(runtime: VmRuntime) {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+    if let Err(error) = runtime.checkpoint_for_shutdown().await {
+        eprintln!("failed to checkpoint runtime during shutdown: {error}");
+    }
 }
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
@@ -487,5 +508,77 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(error["code"], "INVALID_INPUT");
+    }
+
+    #[tokio::test]
+    async fn control_plane_objects_survive_runtime_recreation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("control-plane.json");
+        let factory = Arc::new(InMemoryBackendFactory);
+        let first_runtime = VmRuntime::new_persistent(factory.clone(), &state_path)
+            .await
+            .expect("create persistent runtime");
+        let first_app = build_app(AppState {
+            runtime: first_runtime,
+            token: Arc::from(TOKEN),
+        });
+        let sandbox = create(&first_app, &[]).await;
+        let sandbox_id = sandbox["sandboxId"].as_str().unwrap();
+        let snapshot_response = first_app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("/sandboxes/{sandbox_id}/snapshots"),
+                Body::from("{}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(snapshot_response.status(), StatusCode::CREATED);
+        let snapshot: Value = serde_json::from_slice(
+            &to_bytes(snapshot_response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let snapshot_id = snapshot["snapshotId"].as_str().unwrap();
+        drop(first_app);
+
+        let restored_runtime = VmRuntime::new_persistent(factory, &state_path)
+            .await
+            .expect("restore persistent runtime");
+        let restored_app = build_app(AppState {
+            runtime: restored_runtime,
+            token: Arc::from(TOKEN),
+        });
+        for uri in [
+            format!("/sandboxes/{sandbox_id}"),
+            format!("/snapshots/{snapshot_id}"),
+        ] {
+            let response = restored_app
+                .clone()
+                .oneshot(request("GET", &uri, Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        let restored_from_snapshot = restored_app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/sandboxes",
+                Body::from(format!(r#"{{"snapshotId":"{snapshot_id}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restored_from_snapshot.status(), StatusCode::CREATED);
+        let command = restored_app
+            .oneshot(request(
+                "POST",
+                &format!("/sandboxes/{sandbox_id}/commands"),
+                Body::from(r#"{"command":["true"]}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(command.status(), StatusCode::OK);
     }
 }

@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use vento_runtime_types::{
     CommandRequest, CommandResult, CreateSandboxRequest, FileEntry, IdleAction, SandboxId,
@@ -76,6 +78,24 @@ pub trait SandboxBackendFactory: Send + Sync {
         sandbox_id: &str,
         request: &CreateSandboxRequest,
     ) -> Result<Box<dyn SandboxBackend>, RuntimeError>;
+
+    async fn recover(
+        &self,
+        sandbox_id: &str,
+        request: &CreateSandboxRequest,
+        state: SandboxState,
+    ) -> Result<Box<dyn SandboxBackend>, RuntimeError> {
+        let mut backend = self.create(sandbox_id, request).await?;
+        match state {
+            SandboxState::Running => backend.start().await?,
+            SandboxState::Paused => {
+                backend.start().await?;
+                backend.pause().await?;
+            }
+            _ => {}
+        }
+        Ok(backend)
+    }
 }
 
 struct SandboxRecord {
@@ -95,6 +115,22 @@ impl fmt::Debug for SandboxRecord {
 
 type SharedSandbox = Arc<Mutex<SandboxRecord>>;
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableSandboxRecord {
+    info: SandboxInfo,
+    request: CreateSandboxRequest,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableRuntimeState {
+    version: u32,
+    sandboxes: Vec<DurableSandboxRecord>,
+    snapshots: Vec<SnapshotInfo>,
+    idempotency: HashMap<String, SandboxId>,
+}
+
 #[derive(Clone)]
 pub struct VmRuntime {
     factory: Arc<dyn SandboxBackendFactory>,
@@ -102,6 +138,8 @@ pub struct VmRuntime {
     snapshots: Arc<RwLock<HashMap<SnapshotId, SnapshotInfo>>>,
     idempotency: Arc<Mutex<HashMap<String, SandboxId>>>,
     create_guard: Arc<Mutex<()>>,
+    state_path: Option<Arc<PathBuf>>,
+    persist_guard: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for VmRuntime {
@@ -118,7 +156,63 @@ impl VmRuntime {
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             idempotency: Arc::new(Mutex::new(HashMap::new())),
             create_guard: Arc::new(Mutex::new(())),
+            state_path: None,
+            persist_guard: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub async fn new_persistent(
+        factory: Arc<dyn SandboxBackendFactory>,
+        state_path: impl AsRef<Path>,
+    ) -> Result<Self, RuntimeError> {
+        let state_path = state_path.as_ref().to_owned();
+        let durable = match tokio::fs::read(&state_path).await {
+            Ok(bytes) => {
+                serde_json::from_slice::<DurableRuntimeState>(&bytes).map_err(|error| {
+                    RuntimeError::Backend(format!("invalid runtime state: {error}"))
+                })?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                DurableRuntimeState::default()
+            }
+            Err(error) => return Err(RuntimeError::Backend(error.to_string())),
+        };
+        let runtime = Self {
+            factory: factory.clone(),
+            sandboxes: Arc::new(RwLock::new(HashMap::new())),
+            snapshots: Arc::new(RwLock::new(
+                durable
+                    .snapshots
+                    .into_iter()
+                    .map(|info| (info.snapshot_id.clone(), info))
+                    .collect(),
+            )),
+            idempotency: Arc::new(Mutex::new(durable.idempotency)),
+            create_guard: Arc::new(Mutex::new(())),
+            state_path: Some(Arc::new(state_path)),
+            persist_guard: Arc::new(Mutex::new(())),
+        };
+        for mut saved in durable.sandboxes {
+            if saved.info.has_secrets {
+                saved.info.state = SandboxState::Failed;
+                saved.info.failure_reason = Some(
+                    "sandbox secrets are intentionally not persisted; recreate the sandbox".into(),
+                );
+            }
+            let backend = factory
+                .recover(&saved.info.sandbox_id, &saved.request, saved.info.state)
+                .await?;
+            runtime.sandboxes.write().await.insert(
+                saved.info.sandbox_id.clone(),
+                Arc::new(Mutex::new(SandboxRecord {
+                    info: saved.info,
+                    request: saved.request,
+                    backend,
+                })),
+            );
+        }
+        runtime.persist().await?;
+        Ok(runtime)
     }
 
     pub async fn create(
@@ -190,6 +284,7 @@ impl VmRuntime {
                 .await
                 .insert(key.to_owned(), sandbox_id);
         }
+        self.persist().await?;
         Ok(info)
     }
 
@@ -228,7 +323,10 @@ impl VmRuntime {
         require_state(record.info.state, &[SandboxState::Running])?;
         record.backend.pause().await?;
         update_state(&mut record.info, SandboxState::Paused)?;
-        Ok(record.info.clone())
+        let info = record.info.clone();
+        drop(record);
+        self.persist().await?;
+        Ok(info)
     }
 
     pub async fn resume(&self, sandbox_id: &str) -> Result<SandboxInfo, RuntimeError> {
@@ -265,6 +363,7 @@ impl VmRuntime {
             .lock()
             .await
             .retain(|_, value| value != sandbox_id);
+        self.persist().await?;
         Ok(())
     }
 
@@ -287,6 +386,8 @@ impl VmRuntime {
         let result = record.backend.run_command(request).await?;
         let timeout_seconds = record.request.timeout_seconds;
         touch(&mut record.info, timeout_seconds);
+        drop(record);
+        self.persist().await?;
         Ok(result)
     }
 
@@ -335,6 +436,8 @@ impl VmRuntime {
         record.backend.write_file(path, data).await?;
         let timeout_seconds = record.request.timeout_seconds;
         touch(&mut record.info, timeout_seconds);
+        drop(record);
+        self.persist().await?;
         Ok(())
     }
 
@@ -388,6 +491,8 @@ impl VmRuntime {
             .write()
             .await
             .insert(snapshot_id, info.clone());
+        drop(record);
+        self.persist().await?;
         Ok(info)
     }
 
@@ -406,7 +511,8 @@ impl VmRuntime {
             .await
             .remove(snapshot_id)
             .map(|_| ())
-            .ok_or(RuntimeError::NotFound)
+            .ok_or(RuntimeError::NotFound)?;
+        self.persist().await
     }
 
     pub async fn reap_idle(&self, timestamp_ms: u64) {
@@ -434,6 +540,17 @@ impl VmRuntime {
         }
     }
 
+    pub async fn checkpoint_for_shutdown(&self) -> Result<(), RuntimeError> {
+        let records: Vec<_> = self.sandboxes.read().await.values().cloned().collect();
+        for record in records {
+            let mut record = record.lock().await;
+            if record.info.state == SandboxState::Running && !record.info.has_secrets {
+                record.backend.pause().await?;
+            }
+        }
+        self.persist().await
+    }
+
     async fn transition(
         &self,
         sandbox_id: &str,
@@ -453,7 +570,10 @@ impl VmRuntime {
             BackendAction::Stop => record.backend.stop().await?,
         }
         update_state(&mut record.info, next)?;
-        Ok(record.info.clone())
+        let info = record.info.clone();
+        drop(record);
+        self.persist().await?;
+        Ok(info)
     }
 
     async fn record(&self, sandbox_id: &str) -> Result<SharedSandbox, RuntimeError> {
@@ -463,6 +583,53 @@ impl VmRuntime {
             .get(sandbox_id)
             .cloned()
             .ok_or(RuntimeError::NotFound)
+    }
+
+    async fn persist(&self) -> Result<(), RuntimeError> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let _guard = self.persist_guard.lock().await;
+        let records: Vec<_> = self.sandboxes.read().await.values().cloned().collect();
+        let mut sandboxes = Vec::with_capacity(records.len());
+        for record in records {
+            let record = record.lock().await;
+            let mut request = record.request.clone();
+            request.secrets.clear();
+            sandboxes.push(DurableSandboxRecord {
+                info: record.info.clone(),
+                request,
+            });
+        }
+        let snapshots = self.snapshots.read().await.values().cloned().collect();
+        let idempotency = self.idempotency.lock().await.clone();
+        let durable = DurableRuntimeState {
+            version: 1,
+            sandboxes,
+            snapshots,
+            idempotency,
+        };
+        let bytes = serde_json::to_vec_pretty(&durable)
+            .map_err(|error| RuntimeError::Backend(error.to_string()))?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| RuntimeError::Backend(error.to_string()))?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        tokio::fs::write(&temporary, bytes)
+            .await
+            .map_err(|error| RuntimeError::Backend(error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|error| RuntimeError::Backend(error.to_string()))?;
+        }
+        tokio::fs::rename(&temporary, path.as_ref())
+            .await
+            .map_err(|error| RuntimeError::Backend(error.to_string()))
     }
 }
 

@@ -35,8 +35,9 @@ fn exchange(requests: &[Value]) -> Vec<Value> {
 
 #[test]
 fn readiness_reports_protocol_version_and_invalid_json_is_structured() {
-    let responses = exchange(&[json!({"method":"ready"})]);
-    assert_eq!(responses[0], json!({"result":"ready","data":{"version":2}}));
+    let responses = exchange(&[json!({"method":"ready"}), json!({"method":"sync"})]);
+    assert_eq!(responses[0], json!({"result":"ready","data":{"version":3}}));
+    assert_eq!(responses[1], json!({"result":"empty"}));
 }
 
 #[test]

@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 use std::time::Instant;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use vento_agent_protocol::{AgentRequest, AgentResponse, PROTOCOL_VERSION, validate_guest_path};
-use vento_runtime_types::{CommandResult, FileEntry, new_id, now_ms};
+use vento_runtime_types::{CommandResult, FileEntry, now_ms};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,6 +169,10 @@ async fn handle(request: AgentRequest) -> AgentResponse {
                 Err(error) => agent_error(error),
             }
         }
+        AgentRequest::Sync => {
+            nix::unistd::sync();
+            AgentResponse::Empty
+        }
         AgentRequest::Kill { command_id } => {
             let pid = RUNNING_COMMANDS.lock().await.get(&command_id).copied();
             match pid {
@@ -222,7 +227,7 @@ async fn run(request: vento_runtime_types::CommandRequest) -> AgentResponse {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let input = request.stdin;
-    let command_id = new_id("cmd");
+    let command_id = next_command_id();
     let registry_id = command_id.clone();
     let outcome = tokio::time::timeout(
         std::time::Duration::from_millis(request.timeout_ms),
@@ -265,6 +270,12 @@ static BASE_ENV: LazyLock<RwLock<BTreeMap<String, String>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
 static RUNNING_COMMANDS: LazyLock<tokio::sync::Mutex<HashMap<String, u32>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_command_id() -> String {
+    let sequence = COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("cmd_{}_{sequence}", now_ms())
+}
 
 fn truncate(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.truncate(1024 * 1024);
@@ -306,5 +317,19 @@ fn agent_error(error: std::io::Error) -> AgentResponse {
     AgentResponse::Error {
         code: "IO_ERROR".into(),
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_ids_are_unique_without_guest_entropy() {
+        let first = next_command_id();
+        let second = next_command_id();
+        assert_ne!(first, second);
+        assert!(first.starts_with("cmd_"));
+        assert!(second.starts_with("cmd_"));
     }
 }

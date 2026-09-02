@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use vento_runtime_types::{CommandRequest, CommandResult, FileEntry};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +42,7 @@ pub enum AgentRequest {
         path: String,
         recursive: bool,
     },
+    Sync,
     Shutdown,
 }
 
