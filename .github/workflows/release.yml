@@ -167,10 +167,10 @@ jobs:
       - name: Publish
         if: steps.probe.outputs.published == 'false'
         working-directory: packages/${{ matrix.package }}
-        # prepublishOnly runs `napi prepublish`, which stamps and publishes
-        # the per-platform packages (@ventostack/*-<platform>) and fills
-        # optionalDependencies before the main package goes out.
-        run: npm publish
+        # vm-runtime ships a single trusted-published package containing every
+        # native target. Publishing generated platform packages would require
+        # a separate npm Trusted Publisher registration for each package.
+        run: ${{ matrix.package == 'vm-runtime' && 'npm publish --ignore-scripts' || 'npm publish' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
