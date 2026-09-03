@@ -167,10 +167,8 @@ jobs:
       - name: Publish
         if: steps.probe.outputs.published == 'false'
         working-directory: packages/${{ matrix.package }}
-        # vm-runtime ships a single trusted-published package containing every
-        # native target. Publishing generated platform packages would require
-        # a separate npm Trusted Publisher registration for each package.
-        run: ${{ matrix.package == 'vm-runtime' && 'npm publish --ignore-scripts' || 'npm publish' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: true
+        # prepublishOnly runs `napi prepublish`, publishing the platform
+        # packages and then the main package. All @ventostack/* packages have
+        # GitHub Actions trusted publishers configured on npm, so OIDC is
+        # used (npm >= 11.5.1) and provenance is generated automatically.
+        run: npm publish
