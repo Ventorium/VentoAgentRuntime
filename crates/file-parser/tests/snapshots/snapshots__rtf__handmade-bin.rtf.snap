@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 # Heading via style
@@ -16,10 +16,11 @@ After the binary blob: braces stay balanced.
 
 7. Decimal seven via format override
 
-| Wide header |  |
-| --- | --- |
-| L | R |
-| outer second<br>nested A / nested B |  |
+<table>
+<tr><th colspan="2">Wide header</th></tr>
+<tr><td>L</td><td>R</td></tr>
+<tr><td>outer second<br>nested A / nested B</td></tr>
+</table>
 
 Да
 

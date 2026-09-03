@@ -1,10 +1,11 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
-| Head A | Head B | Head C |
-| --- | --- | --- |
-|  |  |  |
-| legacy start<br>legacy cont |  |  |
+<table>
+<tr><th>Head A</th><th>Head B</th><th rowspan="2">Head C</th></tr>
+<tr><td></td><td></td></tr>
+<tr><td colspan="2">legacy start<br>legacy cont</td><td></td></tr>
+</table>
 
 after the table

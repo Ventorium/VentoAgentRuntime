@@ -478,7 +478,7 @@ fn table_multiparagraph_cell() {
 }
 
 #[test]
-fn merged_cells_render_blank_covered_positions() {
+fn merged_cells_render_as_html_table() {
     let mut b = GridBuilder::new();
     b.next_row();
     b.place(Cell::spanning(
@@ -498,12 +498,75 @@ fn merged_cells_render_blank_covered_positions() {
     let md = doc(vec![Block::Table(table)]);
     assert_eq!(
         md,
-        "| wide |  | end |\n| --- | --- | --- |\n| a | b | c |\n"
+        concat!(
+            "<table>\n",
+            "<tr><th colspan=\"2\">wide</th><th>end</th></tr>\n",
+            "<tr><td>a</td><td>b</td><td>c</td></tr>\n",
+            "</table>\n"
+        )
     );
 }
 
 #[test]
-fn trailing_covered_columns_are_preserved() {
+fn row_spans_render_as_html_rowspan() {
+    let mut b = GridBuilder::new();
+    b.next_row();
+    b.place(Cell::spanning(
+        vec![Block::Paragraph(vec![Inline::plain("tall")])],
+        1,
+        2,
+    ))
+    .unwrap();
+    b.place(Cell::from_inlines(vec![Inline::plain("b1")]))
+        .unwrap();
+    b.next_row();
+    b.place(Cell::from_inlines(vec![Inline::plain("b2")]))
+        .unwrap();
+    let md = doc(vec![Block::Table(b.finish(TableKind::Data))]);
+    assert_eq!(
+        md,
+        concat!(
+            "<table>\n",
+            "<tr><td rowspan=\"2\">tall</td><td>b1</td></tr>\n",
+            "<tr><td>b2</td></tr>\n",
+            "</table>\n"
+        )
+    );
+}
+
+#[test]
+fn html_table_cells_escape_markup() {
+    let mut b = GridBuilder::new();
+    b.next_row();
+    b.place(Cell::spanning(
+        vec![Block::Paragraph(vec![Inline::plain("<a> & \"b\"")])],
+        2,
+        1,
+    ))
+    .unwrap();
+    b.place(Cell::spanning(
+        vec![
+            Block::Paragraph(vec![Inline::plain("one")]),
+            Block::Paragraph(vec![Inline::plain("two")]),
+        ],
+        1,
+        1,
+    ))
+    .unwrap();
+    let md = doc(vec![Block::Table(b.finish(TableKind::Data))]);
+    assert_eq!(
+        md,
+        concat!(
+            "<table>\n",
+            "<tr><td colspan=\"2\">&lt;a&gt; &amp; &quot;b&quot;</td>",
+            "<td>one<br>two</td></tr>\n",
+            "</table>\n"
+        )
+    );
+}
+
+#[test]
+fn trailing_covered_columns_render_as_html_colspan() {
     let mut b = GridBuilder::new();
     b.next_row();
     b.place(Cell::spanning(
@@ -515,7 +578,10 @@ fn trailing_covered_columns_are_preserved() {
     let mut table = b.finish(TableKind::Data);
     table.header_rows = 1;
     let md = doc(vec![Block::Table(table)]);
-    assert_eq!(md, "| wide |  |  |\n| --- | --- | --- |\n");
+    assert_eq!(
+        md,
+        "<table>\n<tr><th colspan=\"3\">wide</th></tr>\n</table>\n"
+    );
 }
 
 #[test]

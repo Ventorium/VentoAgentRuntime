@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 ERROR: page 2 of 2 needs OCR

@@ -8,6 +8,10 @@ pub(crate) enum InlineContext {
     Block,
     Heading,
     TableCell,
+    /// Inside an HTML `<td>`/`<th>` emitted by the merged-table fallback: no
+    /// Markdown syntax can form there, so text passes through verbatim and
+    /// HTML escaping happens afterwards.
+    HtmlCell,
 }
 
 /// Fine-grained escaping context beyond [`InlineContext`]: where the run
@@ -139,6 +143,11 @@ fn can_close(chars: &[char], j: usize, end: usize) -> bool {
 
 /// Escape Markdown syntax in document text.
 pub(crate) fn escape_text(text: &str, ctx: InlineContext, opts: EscapeOpts) -> String {
+    if ctx == InlineContext::HtmlCell {
+        // No Markdown can form inside an HTML table cell; the HTML escape
+        // applied later is the only protection needed.
+        return text.to_string();
+    }
     let EscapeOpts {
         at_line_start,
         styled,

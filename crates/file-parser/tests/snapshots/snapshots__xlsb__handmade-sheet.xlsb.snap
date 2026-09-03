@@ -1,10 +1,11 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
-| Region | north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north | Notes |
-| --- | --- | --- |
-| 42 | 65.0% | $1,234.50 |
-| 1.5 | 0.015 | 2026-03-15 |
-| wide merge |  |  |
-|  |  |  |
+<table>
+<tr><th>Region</th><th>north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north north</th><th>Notes</th></tr>
+<tr><td>42</td><td>65.0%</td><td>$1,234.50</td></tr>
+<tr><td>1.5</td><td>0.015</td><td>2026-03-15</td></tr>
+<tr><td colspan="3" rowspan="2">wide merge</td></tr>
+<tr></tr>
+</table>

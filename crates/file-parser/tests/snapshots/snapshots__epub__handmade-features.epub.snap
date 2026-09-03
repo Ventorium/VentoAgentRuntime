@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 # Feature Book
@@ -12,11 +12,11 @@ expression: output
 
 ~~Struck via class.~~
 
-|  |  |
-| --- | --- |
-| Tall | B1 |
-|  | B2 |
-| A3 | B3 |
+<table>
+<tr><td rowspan="2">Tall</td><td>B1</td></tr>
+<tr><td>B2</td></tr>
+<tr><td>A3</td><td>B3</td></tr>
+</table>
 
 3. three
 

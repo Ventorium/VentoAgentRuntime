@@ -154,7 +154,7 @@ fn render_inlines_mode(inlines: &[Inline], ctx: InlineContext, in_label: bool, r
             Norm::LineBreak => match ctx {
                 InlineContext::Block => out.push_str("\\\n"),
                 InlineContext::Heading => out.push(' '),
-                InlineContext::TableCell => out.push('\n'),
+                InlineContext::TableCell | InlineContext::HtmlCell => out.push('\n'),
             },
             Norm::Math(tex) => push_math_span(tex, ctx, &mut out),
             Norm::Checkbox(checked) => {

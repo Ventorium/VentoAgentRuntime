@@ -1,9 +1,9 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
-|  |  |  |
-| --- | --- | --- |
-| Merged across |  | padded |
-| tall | b2 | 3.5 |
-|  | b3 |  |
+<table>
+<tr><td colspan="2">Merged across</td><td>padded</td></tr>
+<tr><td rowspan="2">tall</td><td>b2</td><td>3.5</td></tr>
+<tr><td>b3</td><td></td></tr>
+</table>

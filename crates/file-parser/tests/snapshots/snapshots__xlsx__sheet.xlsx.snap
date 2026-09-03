@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/file-parser/tests/snapshots.rs
 expression: output
 ---
 ## Values
@@ -16,7 +16,7 @@ expression: output
 
 ## Merged Grid
 
-|  |  |  |
-| --- | --- | --- |
-| Span two |  | Right |
-| 1 | 2 | 3 |
+<table>
+<tr><td colspan="2">Span two</td><td>Right</td></tr>
+<tr><td>1</td><td>2</td><td>3</td></tr>
+</table>

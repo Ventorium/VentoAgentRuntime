@@ -38,11 +38,11 @@ Interrupting paragraph between lists.
 
 ## Table
 
-|  |  |  |
-| --- | --- | --- |
-| Wide head |  | End |
-| Tall | B2 | C2 |
-|  | B3 | C3 |
+<table>
+<tr><td colspan="2">Wide head</td><td>End</td></tr>
+<tr><td rowspan="2">Tall</td><td>B2</td><td>C2</td></tr>
+<tr><td>B3</td><td>C3</td></tr>
+</table>
 
 ## Notes and special text
 
