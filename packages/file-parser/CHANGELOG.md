@@ -1,5 +1,11 @@
 # @ventostack/file-parser
 
+## 0.3.0
+
+### Minor Changes
+
+- [`e1ec26d`](https://github.com/Ventorium/VentoAgentRuntime/commit/e1ec26df17aa55855ca5e26e1f0247cbf37f3b24) Thanks [@erguotou520](https://github.com/erguotou520)! - Render tables containing merged cells as an HTML `<table>` with `colspan`/`rowspan` instead of blank placeholder cells, since GFM pipe tables cannot represent spans. Span-less tables still render as GFM markdown.
+
 ## 0.2.0
 
 ### Minor Changes
