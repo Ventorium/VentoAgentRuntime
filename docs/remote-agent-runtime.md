@@ -4,8 +4,8 @@
 
 ## 已验证环境
 
-- PVE：`root@192.168.10.10`
-- VM：ID 105，主机名 `vento-runtime-kvm`，地址 `192.168.10.210`
+- PVE：`root@192.168.8.8`
+- VM：ID 105，主机名 `vento-runtime-kvm`，地址 `192.168.8.210`
 - VM 日常 SSH 用户：`vento`
 - Firecracker / jailer：1.16.1
 - Rust：1.94.1
@@ -16,8 +16,8 @@
 从本机经 PVE 登录 VM：
 
 ```bash
-ssh root@192.168.10.10
-ssh vento@192.168.10.210
+ssh root@192.168.8.8
+ssh vento@192.168.8.210
 ```
 
 ## 部署布局
@@ -88,7 +88,7 @@ Group=root
 WorkingDirectory=/vento/VentoAgentRuntime-current
 EnvironmentFile=/etc/vento-agent-runtime.env
 Environment=PATH=/home/vento/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/vento/VentoAgentRuntime-current/target/release/vento-runtime-server --listen 127.0.0.1:8088 --firecracker-config /vento/vento-firecracker-next.json
+ExecStart=/vento/VentoAgentRuntime-current/target/release/vento-runtime-server --listen 192.168.8.210:8088 --firecracker-config /vento/vento-firecracker-next.json
 Restart=on-failure
 RestartSec=2s
 KillMode=control-group
@@ -117,11 +117,17 @@ sudo chmod 0600 /etc/vento-agent-runtime.env
 sudo systemctl start vento-agent-runtime
 ```
 
-如需从本地调用，优先使用 SSH 端口转发：
+服务仅绑定 VM 的明确内网地址，不绑定 `0.0.0.0`。这是内部服务的架构例外：局域网内使用 HTTP，但所有业务接口仍强制 Bearer Token，Token 不得进入日志、数据库、浏览器或源码；公网不得路由到 TCP 8088。`/health` 保持无鉴权以供探针使用。
 
-```bash
-ssh -L 8088:127.0.0.1:8088 vento@192.168.10.210
+Fullstack 连接配置：
+
+```dotenv
+VENTO_RUNTIME_URL=http://192.168.8.210:8088
+VENTO_RUNTIME_TOKEN=<与 /etc/vento-agent-runtime.env 一致>
+VENTO_RUNTIME_TIMEOUT_MS=30000
 ```
+
+修改监听地址前的 systemd 回滚副本位于 `/etc/systemd/system/vento-agent-runtime.service.pre-lan`。
 
 ## 验收流程
 
