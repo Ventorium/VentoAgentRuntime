@@ -1,23 +1,22 @@
-# VM 105 Agent Runtime 部署与运维
+# Agent Runtime 远程部署与运维
 
-本文记录 2026-09-02 在 Proxmox VE 虚拟机 105 上验证通过的 Vento Agent Runtime 部署。
+本文记录在支持嵌套 KVM 的虚拟机上部署 Vento Agent Runtime 的通用流程。具体主机地址、虚拟机 ID、主机名和凭据不得提交到仓库。
 
 ## 已验证环境
 
-- PVE：`root@192.168.8.8`
-- VM：ID 105，主机名 `vento-runtime-kvm`，地址 `192.168.8.210`
-- VM 日常 SSH 用户：`vento`
+- PVE、VM 地址及 VM ID：由部署环境提供，不记录在仓库
+- VM 日常 SSH 用户：使用部署环境配置的非 root 运维用户
 - Firecracker / jailer：1.16.1
 - Rust：1.94.1
 - 虚拟化：嵌套 KVM，VM 内存在可读写的 `/dev/kvm`
 - cgroup：cgroup v2
 - 数据盘：`/vento`，XFS，支持 reflink
 
-从本机经 PVE 登录 VM：
+从本机经 PVE 登录 VM（以下均为占位符）：
 
 ```bash
-ssh root@192.168.8.8
-ssh vento@192.168.8.210
+ssh <pve-user>@<pve-host>
+ssh <runtime-user>@<runtime-host>
 ```
 
 ## 部署布局
@@ -88,7 +87,7 @@ Group=root
 WorkingDirectory=/vento/VentoAgentRuntime-current
 EnvironmentFile=/etc/vento-agent-runtime.env
 Environment=PATH=/home/vento/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/vento/VentoAgentRuntime-current/target/release/vento-runtime-server --listen 192.168.8.210:8088 --firecracker-config /vento/vento-firecracker-next.json
+ExecStart=/vento/VentoAgentRuntime-current/target/release/vento-runtime-server --listen <runtime-private-ip>:8088 --firecracker-config /vento/vento-firecracker-next.json
 Restart=on-failure
 RestartSec=2s
 KillMode=control-group
@@ -122,7 +121,7 @@ sudo systemctl start vento-agent-runtime
 Fullstack 连接配置：
 
 ```dotenv
-VENTO_RUNTIME_URL=http://192.168.8.210:8088
+VENTO_RUNTIME_URL=http://<runtime-private-host>:8088
 VENTO_RUNTIME_TOKEN=<与 /etc/vento-agent-runtime.env 一致>
 VENTO_RUNTIME_TIMEOUT_MS=30000
 ```
@@ -165,7 +164,7 @@ sudo env \
 
 `secrets` 永远不会写入控制面状态文件。包含 secrets 的 sandbox 重启后会标记为 `FAILED`，并要求使用者重新创建和重新注入 secrets，避免在磁盘上泄露凭据或静默以缺失凭据的环境运行。
 
-已在 VM 105 上通过真实门禁：写入文件、创建 snapshot、`systemctl restart`、查询原 sandbox/snapshot、在原 sandbox 执行命令和读回文件、从重启前 snapshot 创建新 sandbox 并读回同一文件、最后销毁两个 sandbox。
+已在目标运行环境通过真实门禁：写入文件、创建 snapshot、`systemctl restart`、查询原 sandbox/snapshot、在原 sandbox 执行命令和读回文件、从重启前 snapshot 创建新 sandbox 并读回同一文件、最后销毁两个 sandbox。
 
 ## 本次修复和故障排查
 
