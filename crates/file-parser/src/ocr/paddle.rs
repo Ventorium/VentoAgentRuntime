@@ -17,6 +17,8 @@ const DEFAULT_MODEL: &str = "PaddleOCR-VL-1.6";
 const PER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay between job-state polls.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Backoff when the upstream rate-limits us (error 12002 / HTTP 429).
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Connection settings for the PaddleOCR job service.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,6 +88,19 @@ impl PaddleOcrConfig {
                 false,
             ));
         }
+        if let Some(model) = &self.model
+            && !is_supported_model(model)
+        {
+            return Err(OcrError::new(
+                "invalid_config",
+                format!(
+                    "paddleOcr.model '{model}' is not supported: only PaddleOCR-VL* and \
+                     PP-StructureV3* return layoutParsingResults markdown (PP-OCRv5 returns \
+                     ocrResults, which the markdown contract cannot consume)"
+                ),
+                false,
+            ));
+        }
         for key in self.optional_payload.keys() {
             if is_reserved_payload_key(key) {
                 return Err(OcrError::new(
@@ -149,7 +164,13 @@ impl PaddleOcrProvider {
 
     /// Submit the file; returns the job id. Transient failures are retried
     /// up to the configured attempt count (each retry creates a new job).
-    async fn submit_job(&self, request: &OcrRequest) -> Result<String, OcrError> {
+    /// `page_ranges` is the upstream `pageRanges` syntax ("2,4-6"), empty to
+    /// process the whole file.
+    async fn submit_job(
+        &self,
+        request: &OcrRequest,
+        page_ranges: &str,
+    ) -> Result<String, OcrError> {
         let optional_payload = Value::Object(self.config.optional_payload.clone()).to_string();
         let attempts = self.config.retries.max(1);
         let mut last_error: Option<OcrError> = None;
@@ -160,7 +181,7 @@ impl PaddleOcrProvider {
                 .map_err(|e| {
                     OcrError::new("invalid_input", format!("bad file name: {e}"), false)
                 })?;
-            let form = reqwest::multipart::Form::new()
+            let mut form = reqwest::multipart::Form::new()
                 .text(
                     "model",
                     self.config
@@ -168,8 +189,11 @@ impl PaddleOcrProvider {
                         .clone()
                         .unwrap_or_else(|| DEFAULT_MODEL.into()),
                 )
-                .text("optionalPayload", optional_payload.clone())
-                .part("file", part);
+                .text("optionalPayload", optional_payload.clone());
+            if !page_ranges.is_empty() {
+                form = form.text("pageRanges", page_ranges.to_owned());
+            }
+            let form = form.part("file", part);
             match self
                 .client
                 .post(&self.config.endpoint)
@@ -185,7 +209,8 @@ impl PaddleOcrProvider {
                         let error = OcrError::new(
                             "upstream_error",
                             format!("paddleOcr submit returned HTTP {status}: {text}"),
-                            status.is_server_error(),
+                            status.is_server_error()
+                                || status == reqwest::StatusCode::TOO_MANY_REQUESTS,
                         );
                         if error.retryable && attempt + 1 < attempts {
                             last_error = Some(error);
@@ -256,6 +281,12 @@ impl PaddleOcrProvider {
                 })?;
             let status = response.status();
             if !status.is_success() {
+                // Rate-limited (error 12002): back off longer and keep
+                // polling — the job itself is unaffected.
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
+                    continue;
+                }
                 let text = response.text().await.unwrap_or_default();
                 let error = OcrError::new(
                     "upstream_error",
@@ -319,13 +350,14 @@ impl OcrProvider for PaddleOcrProvider {
     async fn recognize(
         &self,
         request: OcrRequest,
-        _options: OcrOptions,
+        options: OcrOptions,
     ) -> Result<OcrOutput, OcrError> {
         if request.bytes.is_empty() {
             return Err(OcrError::new("invalid_input", "OCR input is empty", false));
         }
         let deadline = Instant::now() + Duration::from_millis(self.config.timeout_ms.max(1_000));
-        let job_id = self.submit_job(&request).await?;
+        let page_ranges = format_page_ranges(&options.page_numbers);
+        let job_id = self.submit_job(&request, &page_ranges).await?;
         let json_url = self.wait_for_result_url(&job_id, deadline).await?;
 
         // The result URL is pre-signed; authentication headers are not
@@ -364,7 +396,43 @@ impl OcrProvider for PaddleOcrProvider {
 }
 
 fn is_reserved_payload_key(key: &str) -> bool {
-    matches!(key, "file" | "fileUrl" | "model" | "lang")
+    matches!(key, "file" | "fileUrl" | "model" | "lang" | "pageRanges")
+}
+
+/// Models whose job results carry `result.layoutParsingResults` markdown —
+/// the only shape [`parse_jsonl_markdown`] understands. PP-OCRv5 returns
+/// `result.ocrResults` (result images, no markdown) and cannot feed the
+/// markdown contract.
+fn is_supported_model(model: &str) -> bool {
+    let model = model.trim();
+    model.starts_with("PaddleOCR-VL") || model.starts_with("PP-StructureV3")
+}
+
+/// Collapse 1-indexed page numbers into the upstream `pageRanges` syntax:
+/// sorted, deduped, consecutive runs joined (`[6, 2, 3, 4, 2]` → `"2-4,6"`).
+/// Empty input formats to the empty string (the field is then omitted).
+fn format_page_ranges(pages: &[u32]) -> String {
+    let mut sorted = pages.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = String::new();
+    let mut run_start = 0;
+    for idx in 0..sorted.len() {
+        let run_ends = idx + 1 == sorted.len() || sorted[idx + 1] != sorted[idx] + 1;
+        if !run_ends {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if idx == run_start {
+            out.push_str(&sorted[idx].to_string());
+        } else {
+            out.push_str(&format!("{}-{}", sorted[run_start], sorted[idx]));
+        }
+        run_start = idx + 1;
+    }
+    out
 }
 
 fn mime_for(file_name: &str) -> &'static str {
@@ -470,5 +538,52 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.message.contains("reserved"));
+        let error = PaddleOcrConfig::from_value(serde_json::json!({
+            "endpoint": "https://example.test/jobs",
+            "optionalPayload": {"pageRanges": "1-2"}
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("reserved"));
+    }
+
+    #[test]
+    fn config_rejects_markdown_incapable_models() {
+        for model in ["PP-OCRv5", "PaddleOCR-X", "paddleocr-vl-1.6"] {
+            let error = PaddleOcrConfig::from_value(serde_json::json!({
+                "endpoint": "https://example.test/jobs",
+                "model": model
+            }))
+            .unwrap_err();
+            assert_eq!(
+                error.code, "invalid_config",
+                "model {model} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn config_accepts_markdown_capable_models() {
+        for model in [
+            None,
+            Some("PaddleOCR-VL"),
+            Some("PaddleOCR-VL-1.6"),
+            Some("PP-StructureV3"),
+        ] {
+            let mut config = serde_json::json!({"endpoint": "https://example.test/jobs"});
+            if let Some(model) = model {
+                config["model"] = Value::from(model);
+            }
+            PaddleOcrConfig::from_value(config).expect("markdown-capable model should validate");
+        }
+    }
+
+    #[test]
+    fn page_ranges_formatting() {
+        assert_eq!(format_page_ranges(&[]), "");
+        assert_eq!(format_page_ranges(&[1]), "1");
+        assert_eq!(format_page_ranges(&[2, 3, 4, 6]), "2-4,6");
+        // Unsorted + duplicated input collapses the same way.
+        assert_eq!(format_page_ranges(&[6, 2, 3, 4, 2]), "2-4,6");
+        assert_eq!(format_page_ranges(&[1, 2, 3, 5, 6, 7, 9]), "1-3,5-7,9");
     }
 }
