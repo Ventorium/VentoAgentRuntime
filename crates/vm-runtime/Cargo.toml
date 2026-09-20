@@ -11,8 +11,8 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-vento-agent-protocol = { path = "../agent-protocol" }
-vento-runtime-types = { path = "../runtime-types" }
+vento-agent-protocol.workspace = true
+vento-runtime-types.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

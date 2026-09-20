@@ -1,9 +1,28 @@
 [advisories]
 unmaintained = "workspace"
+# ttf-parser (RUSTSEC-2026-0192) has no safe upgrade: it is a direct dependency
+# of the PDF engine for cmap/glyph-name parsing and is also pulled in by lopdf.
+# Ignored until the parser moves to skrifa (the advisory's suggested successor).
+ignore = [
+  { id = "RUSTSEC-2026-0192", reason = "no maintained drop-in replacement wired up yet; tracked for a skrifa migration" },
+]
 
 [licenses]
 confidence-threshold = 0.93
-allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+# Unicode-3.0: unicode-normalization. NCSA: libfuzzer-sys, a rav1e build input
+# pulled in by image's avif support. CDLA-Permissive-2.0: the CA root list in
+# webpki-roots.
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "NCSA",
+  "Unicode-3.0",
+  "Zlib",
+]
 
 [bans]
 multiple-versions = "warn"

@@ -11,5 +11,5 @@ serde_json.workspace = true
 nix.workspace = true
 tokio.workspace = true
 vsock.workspace = true
-vento-agent-protocol = { path = "../../crates/agent-protocol" }
-vento-runtime-types = { path = "../../crates/runtime-types" }
+vento-agent-protocol.workspace = true
+vento-runtime-types.workspace = true

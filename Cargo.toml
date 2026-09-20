@@ -53,6 +53,14 @@ tower-http = { version = "=0.6.8", features = ["limit", "request-id", "trace"] }
 ttf-parser = "=0.25.1"
 unicode-normalization = "=0.1.25"
 uuid = { version = "=1.23.0", features = ["serde", "v7"] }
+# In-tree crates carry both a path and the workspace version: cargo-deny denies
+# version-less (wildcard) dependencies.
+vento-agent-protocol = { path = "crates/agent-protocol", version = "0.1.0" }
+vento-file-parser = { path = "crates/file-parser", version = "0.1.0" }
+vento-firecracker-runtime = { path = "crates/firecracker-runtime", version = "0.1.0" }
+vento-pdf-engine = { path = "crates/pdf-engine", version = "0.1.0" }
+vento-runtime-types = { path = "crates/runtime-types", version = "0.1.0" }
+vento-vm-runtime = { path = "crates/vm-runtime", version = "0.1.0" }
 vsock = "=0.5.4"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 

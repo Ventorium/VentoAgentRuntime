@@ -10,5 +10,5 @@ publish = false
 clap.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-vento-file-parser = { path = "../../crates/file-parser" }
+vento-file-parser.workspace = true
 

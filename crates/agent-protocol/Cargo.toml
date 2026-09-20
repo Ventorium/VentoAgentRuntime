@@ -8,5 +8,5 @@ publish = false
 
 [dependencies]
 serde.workspace = true
-vento-runtime-types = { path = "../runtime-types" }
+vento-runtime-types.workspace = true
 

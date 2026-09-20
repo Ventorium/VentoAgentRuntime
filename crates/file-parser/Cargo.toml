@@ -21,7 +21,7 @@ regex.workspace = true
 zip.workspace = true
 
 # pdf-inspector 作为本地依赖（原 anydoc 通过 crates.io 依赖它；我们改为内树）
-vento-pdf-engine = { path = "../pdf-engine" }
+vento-pdf-engine.workspace = true
 
 # 我们自己的薄壳 + 远程 OCR
 async-trait.workspace = true
