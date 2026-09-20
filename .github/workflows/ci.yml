@@ -27,10 +27,12 @@ jobs:
           command: check
 
   # Package changes must ship a changeset, otherwise they never reach npm.
-  # The changesets-action version PRs do not run this check (events raised by
-  # GITHUB_TOKEN trigger no workflows).
+  # The changesets-action version PR is exempt: it consumes the changesets, so
+  # by construction it has none left to find. It would otherwise fail here
+  # whenever its run is approved, so the branch is skipped explicitly rather
+  # than relying on runs it opens being held at "action required".
   changesets:
-    if: github.event_name == 'pull_request'
+    if: "github.event_name == 'pull_request' && !startsWith(github.head_ref, 'changeset-release/')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
