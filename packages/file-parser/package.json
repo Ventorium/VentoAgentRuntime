@@ -1,6 +1,6 @@
 {
   "name": "@ventostack/file-parser",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Rust-native file parser converting enterprise documents to LLM Markdown",
   "license": "MIT",
   "repository": {
