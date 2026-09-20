@@ -7,7 +7,8 @@ const outDir = path.resolve(__dirname, '../../test-files/out');
 fs.mkdirSync(outDir, { recursive: true });
 
 // Embedded-image OCR routes to the remote provider; without credentials the
-// images degrade to plain `![图片](?)` markers. Token comes from
+// images degrade to plain `![图片N]()` markers, and with them each image is
+// followed by a quoted `> 图片N的OCR解析结果如下：` block. Token comes from
 // PADDLE_OCR_TOKEN, never hardcoded.
 const ocrToken = process.env.PADDLE_OCR_TOKEN || '';
 const options = JSON.stringify({

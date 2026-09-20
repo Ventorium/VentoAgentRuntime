@@ -1,8 +1,29 @@
-use super::document_to_markdown;
+use super::{document_to_markdown, document_to_markdown_with_ocr};
 use crate::model::{
-    AnchorId, Block, Cell, Document, GridBuilder, ImageSource, Inline, LinkTarget, List, ListItem,
-    MarkerKind, Note, NoteKind, Style, Table, TableKind,
+    AnchorId, AssetId, Block, Cell, Document, GridBuilder, ImageSource, Inline, LinkTarget, List,
+    ListItem, MarkerKind, Note, NoteKind, Style, Table, TableKind,
 };
+use crate::ocr::OcrOutcome;
+
+fn image(alt: &str, asset: usize) -> Inline {
+    Inline::Image {
+        alt: alt.into(),
+        source: ImageSource::Asset(AssetId(asset)),
+    }
+}
+
+fn doc_with_ocr(blocks: Vec<Block>, ocr: Vec<(usize, OcrOutcome)>) -> String {
+    document_to_markdown_with_ocr(
+        &Document {
+            blocks,
+            notes: Vec::new(),
+            assets: Vec::new(),
+        },
+        ocr.into_iter()
+            .map(|(id, outcome)| (AssetId(id), outcome))
+            .collect(),
+    )
+}
 
 fn doc(blocks: Vec<Block>) -> String {
     document_to_markdown(&Document {
@@ -359,12 +380,78 @@ fn unresolved_anchor_degrades_to_text() {
 }
 
 #[test]
+fn ocr_text_follows_its_image_as_a_quoted_block() {
+    let md = doc_with_ocr(
+        vec![
+            Block::Paragraph(vec![Inline::plain("Before.")]),
+            Block::Paragraph(vec![image("chart", 0)]),
+            Block::Paragraph(vec![Inline::plain("After.")]),
+        ],
+        vec![(0, OcrOutcome::Text("# 标题\n\n| a | b |".into()))],
+    );
+    assert_eq!(
+        md,
+        "Before.\n\n![图片1：chart]()\n\n> 图片1的OCR解析结果如下：\n>\n> # 标题\n>\n> | a | b |\n\nAfter.\n"
+    );
+}
+
+#[test]
+fn images_are_numbered_by_first_reference() {
+    let md = doc_with_ocr(
+        vec![
+            Block::Paragraph(vec![Inline::plain("One:"), image("", 5)]),
+            Block::Paragraph(vec![image("", 2)]),
+            // Same asset again: same number, and no second annotation.
+            Block::Paragraph(vec![image("", 5)]),
+        ],
+        vec![
+            (5, OcrOutcome::Text("five".into())),
+            (2, OcrOutcome::Text("two".into())),
+        ],
+    );
+    assert_eq!(
+        md,
+        "One:![图片1]()\n\n> 图片1的OCR解析结果如下：\n>\n> five\n\n\
+         ![图片2]()\n\n> 图片2的OCR解析结果如下：\n>\n> two\n\n![图片1]()\n"
+    );
+}
+
+#[test]
+fn images_without_ocr_results_get_no_annotation() {
+    // No provider configured: every image keeps its bare marker, but the
+    // asset-backed one is still numbered.
+    let md = doc_with_ocr(
+        vec![
+            Block::Paragraph(vec![image("chart", 0)]),
+            Block::Paragraph(vec![Inline::Image {
+                alt: "lost".into(),
+                source: ImageSource::Unavailable,
+            }]),
+        ],
+        vec![],
+    );
+    assert_eq!(md, "![图片1：chart]()\n\n![图片：lost]()\n");
+}
+
+#[test]
+fn failed_ocr_announces_the_failure() {
+    let md = doc_with_ocr(
+        vec![Block::Paragraph(vec![image("scan", 3)])],
+        vec![(3, OcrOutcome::Failed)],
+    );
+    assert_eq!(
+        md,
+        "![图片1：scan]()\n\n> 图片1的OCR解析结果如下：\n>\n> （OCR识别失败）\n"
+    );
+}
+
+#[test]
 fn sourceless_image_renders_alt_text() {
     let md = doc(vec![Block::Paragraph(vec![Inline::Image {
         alt: "chart".into(),
         source: ImageSource::Unavailable,
     }])]);
-    assert_eq!(md, "![图片：chart](?)\n");
+    assert_eq!(md, "![图片：chart]()\n");
 }
 
 #[test]

@@ -11,8 +11,9 @@
 //!    (extract for text-bearing containers);
 //! 3. the result metadata round-trips: filename, size, mime, duration.
 //!
-//! The OCR path is not exercised here — it would require a live PaddleOCR
-//! endpoint or a stub HTTP server. The `OcrRequired` error is covered by a
+//! The HTTP OCR provider is not exercised here — it would require a live
+//! PaddleOCR endpoint or a stub HTTP server. The embedded-image OCR pass is
+//! covered with an in-process stub provider, and the `OcrRequired` error by a
 //! small unit test inside the crate.
 
 use std::path::PathBuf;
@@ -308,4 +309,60 @@ async fn image_without_ocr_provider_reports_ocr_required() {
         "got {err:?}"
     );
     assert_eq!(err.code(), "OCR_REQUIRED");
+}
+
+/// An embedded image's recognized text is emitted as an annotation block
+/// after its marker — never inside the alt text, where brackets, pipes and
+/// newlines in the OCR output would break the surrounding Markdown.
+#[tokio::test]
+async fn embedded_image_ocr_becomes_an_annotation_block() {
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl vento_file_parser::OcrProvider for StubProvider {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn recognize(
+            &self,
+            _request: vento_file_parser::OcrRequest,
+            _options: vento_file_parser::OcrOptions,
+        ) -> Result<vento_file_parser::OcrOutput, vento_file_parser::OcrError> {
+            Ok(vento_file_parser::OcrOutput {
+                markdown: "# 标题\n\n| a | b |".into(),
+                confidence: None,
+                provider: "stub".into(),
+            })
+        }
+    }
+
+    // The parser fixtures live next to this crate, not in the generated set.
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/docx/handmade-rich.docx");
+    let bytes = std::fs::read(path).unwrap();
+    let parser = FileParser::new().with_ocr(std::sync::Arc::new(StubProvider));
+    let result = parser
+        .convert(
+            DocumentInput::Bytes {
+                data: bytes,
+                file_name: "handmade-rich.docx".into(),
+            },
+            ConvertOptions::default(),
+        )
+        .await
+        .expect("conversion succeeds");
+
+    assert!(
+        result.markdown.contains("![图片1：tiny dot image]()"),
+        "alt keeps the number and drops the OCR text:\n{}",
+        result.markdown
+    );
+    assert!(
+        result
+            .markdown
+            .contains("> 图片1的OCR解析结果如下：\n>\n> # 标题\n>\n> | a | b |"),
+        "recognized text follows the image as a quoted block:\n{}",
+        result.markdown
+    );
 }

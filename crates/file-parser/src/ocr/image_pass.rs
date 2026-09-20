@@ -4,7 +4,7 @@
 //! Every unique image (deduped by content hash of the original bytes) is sent
 //! to the configured provider, downscaled first when oversized, with bounded
 //! concurrency and a per-image timeout. Failures never abort the conversion:
-//! the image still renders as a `![…](?)` marker, just without OCR text.
+//! the image still renders as a `![…]()` marker with no annotation block.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -242,29 +242,44 @@ fn replace_extension(name: &str, ext: &str) -> String {
     }
 }
 
-/// Compose the alt text for an embedded image: fixed `图片` prefix (greppable),
-/// the document's own alt when present, and the OCR tail. `outcome` is the
-/// per-hash lookup result; `None` means no provider / disabled / duplicate
-/// without its own entry.
-pub(crate) fn compose_alt(original_alt: &str, outcome: Option<&OcrOutcome>) -> String {
-    let mut alt = String::from("图片");
+/// Compose the alt text for an embedded image: fixed `图片` prefix (greppable)
+/// plus the document's own alt when present. `number` is the image's
+/// document-order figure number; recognized text never goes in here — it is
+/// emitted as a separate [`ocr_annotation`] block, because arbitrary OCR text
+/// (brackets, pipes, line starts) would otherwise break the surrounding
+/// Markdown.
+pub(crate) fn compose_alt(original_alt: &str, number: Option<usize>) -> String {
+    let mut alt = match number {
+        Some(number) => format!("图片{number}"),
+        None => String::from("图片"),
+    };
     let original = flatten(original_alt);
     if !original.is_empty() {
         alt.push('：');
         push_escaped(&mut alt, &original);
     }
-    match outcome {
-        Some(OcrOutcome::Text(text)) => {
-            let text = flatten(text);
-            if !text.is_empty() {
-                alt.push_str("，OCR识别文字是：");
-                push_escaped(&mut alt, &text);
-            }
-        }
-        Some(OcrOutcome::Failed) => alt.push_str("，OCR识别失败"),
-        None => {}
-    }
     alt
+}
+
+/// The annotation block that follows an OCR'd image: the recognized text
+/// quoted line by line, so nothing in it can restructure the document around
+/// it. `number` matches the image's alt label.
+pub(crate) fn ocr_annotation(number: usize, outcome: &OcrOutcome) -> String {
+    let body = match outcome {
+        OcrOutcome::Text(text) if !text.trim().is_empty() => text.trim(),
+        _ => "（OCR识别失败）",
+    };
+    let mut out = format!("> 图片{number}的OCR解析结果如下：\n>");
+    for line in body.lines() {
+        out.push('\n');
+        if line.trim_end().is_empty() {
+            out.push('>');
+        } else {
+            out.push_str("> ");
+            out.push_str(line.trim_end());
+        }
+    }
+    out
 }
 
 /// Collapse all whitespace runs (including newlines) to single spaces: alt
@@ -415,24 +430,35 @@ mod tests {
 
     #[test]
     fn compose_alt_templates() {
-        assert_eq!(
-            compose_alt("", Some(&OcrOutcome::Text("hello world".into()))),
-            "图片，OCR识别文字是：hello world"
-        );
-        assert_eq!(
-            compose_alt("", Some(&OcrOutcome::Failed)),
-            "图片，OCR识别失败"
-        );
+        assert_eq!(compose_alt("", Some(3)), "图片3");
         assert_eq!(compose_alt("", None), "图片");
         // Original alt is kept, whitespace collapsed, brackets escaped.
+        assert_eq!(compose_alt("a [b]", Some(3)), "图片3：a \\[b\\]");
+    }
+
+    #[test]
+    fn annotation_quotes_every_line() {
+        let annotation = ocr_annotation(3, &OcrOutcome::Text("# 标题\n\n| a | b |".into()));
         assert_eq!(
-            compose_alt("a [b]", Some(&OcrOutcome::Text("line1\nline2".into()))),
-            "图片：a \\[b\\]，OCR识别文字是：line1 line2"
+            annotation,
+            "> 图片3的OCR解析结果如下：\n>\n> # 标题\n>\n> | a | b |"
         );
-        // Empty recognition text drops the tail entirely.
+        // Nothing in the quoted block can open a heading or a table at the
+        // document level.
+        for line in annotation.lines() {
+            assert!(line == ">" || line.starts_with("> "), "unquoted: {line}");
+        }
+    }
+
+    #[test]
+    fn annotation_reports_failure_and_empty_text() {
         assert_eq!(
-            compose_alt("", Some(&OcrOutcome::Text("  ".into()))),
-            "图片"
+            ocr_annotation(1, &OcrOutcome::Failed),
+            "> 图片1的OCR解析结果如下：\n>\n> （OCR识别失败）"
+        );
+        assert_eq!(
+            ocr_annotation(1, &OcrOutcome::Text("  \n".into())),
+            "> 图片1的OCR解析结果如下：\n>\n> （OCR识别失败）"
         );
     }
 }

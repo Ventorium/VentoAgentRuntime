@@ -11,7 +11,7 @@ use thiserror::Error;
 
 pub(crate) use image_pass::{
     ImageOcrConfig, OcrImage, OcrOutcome, compose_alt, content_hash, ensure_image_extension,
-    run_image_ocr,
+    ocr_annotation, run_image_ocr,
 };
 pub use paddle::{PaddleOcrConfig, PaddleOcrProvider};
 

@@ -9,8 +9,11 @@ mod table;
 mod tests;
 
 use crate::model::AssetId;
-use crate::model::{Block, Document, Inline, List, MarkerKind, Note, TableKind, inlines_are_empty};
-use crate::ocr::OcrOutcome;
+use crate::model::{
+    Block, CellSlot, Document, ImageSource, Inline, List, MarkerKind, Note, TableKind,
+    inlines_are_empty,
+};
+use crate::ocr::{OcrOutcome, ocr_annotation};
 use anchors::{AnchorMap, resolve_anchors};
 use escape::{EscapeOpts, InlineContext, backtick_fence, escape_text};
 use inline::render_inlines;
@@ -40,12 +43,16 @@ type NoteNumbers = HashMap<String, usize>;
 pub(crate) struct Ctx {
     nums: NoteNumbers,
     anchors: AnchorMap,
-    /// Per-asset OCR outcomes produced by the embedded-image OCR pass;
-    /// assets without an entry render a plain `图片` alt.
+    /// `图片N` figure numbers for embedded image assets, in first-reference
+    /// order; assets referenced nowhere keep the bare `图片` alt.
+    asset_numbers: HashMap<AssetId, usize>,
+    /// Per-asset OCR outcomes produced by the embedded-image OCR pass; each
+    /// one is emitted as an annotation block after the block that first
+    /// references the image.
     asset_ocr: HashMap<AssetId, OcrOutcome>,
 }
 
-/// Render with per-asset OCR alt text for embedded images.
+/// Render with per-asset OCR annotation blocks for embedded images.
 pub fn document_to_markdown_with_ocr(
     doc: &Document,
     asset_ocr: HashMap<AssetId, OcrOutcome>,
@@ -53,13 +60,11 @@ pub fn document_to_markdown_with_ocr(
     let rc = Ctx {
         nums: number_notes(doc),
         anchors: resolve_anchors(doc),
+        asset_numbers: number_assets(doc),
         asset_ocr,
     };
-    let mut parts: Vec<String> = doc
-        .blocks
-        .iter()
-        .filter_map(|b| render_block(b, &rc))
-        .collect();
+    let mut annotated: HashSet<AssetId> = HashSet::new();
+    let mut parts: Vec<String> = render_blocks_with_annotations(&doc.blocks, &rc, &mut annotated);
     let mut rendered_defs: HashSet<usize> = HashSet::new();
     let mut ordered: Vec<(&Note, usize)> = doc
         .notes
@@ -68,7 +73,7 @@ pub fn document_to_markdown_with_ocr(
         .collect();
     ordered.sort_by_key(|(_, num)| *num);
     for (note, num) in ordered {
-        let body = render_blocks(&note.blocks, &rc);
+        let body = render_blocks_with_annotations(&note.blocks, &rc, &mut annotated).join("\n\n");
         if body.is_empty() {
             continue;
         }
@@ -187,6 +192,104 @@ fn collect_note_refs(
 fn render_blocks(blocks: &[Block], rc: &Ctx) -> String {
     let parts: Vec<String> = blocks.iter().filter_map(|b| render_block(b, rc)).collect();
     parts.join("\n\n")
+}
+
+/// Render `blocks`, appending each OCR'd image's annotation block right after
+/// the block that first references it. `annotated` is shared across the whole
+/// document so an image referenced repeatedly is annotated once, next to its
+/// first occurrence.
+fn render_blocks_with_annotations(
+    blocks: &[Block],
+    rc: &Ctx,
+    annotated: &mut HashSet<AssetId>,
+) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for block in blocks {
+        let Some(rendered) = render_block(block, rc) else {
+            continue;
+        };
+        parts.push(rendered);
+        for id in block_image_assets(block) {
+            if !annotated.insert(id) {
+                continue;
+            }
+            let (Some(outcome), Some(number)) = (rc.asset_ocr.get(&id), rc.asset_numbers.get(&id))
+            else {
+                continue;
+            };
+            parts.push(ocr_annotation(*number, outcome));
+        }
+    }
+    parts
+}
+
+/// Figure numbers for embedded images, in first-reference order: blocks
+/// first, then note bodies, matching render order.
+fn number_assets(doc: &Document) -> HashMap<AssetId, usize> {
+    let mut ids: Vec<AssetId> = Vec::new();
+    for block in &doc.blocks {
+        collect_block_assets(block, &mut ids);
+    }
+    for note in &doc.notes {
+        for block in &note.blocks {
+            collect_block_assets(block, &mut ids);
+        }
+    }
+    let mut numbers = HashMap::new();
+    for id in ids {
+        let next = numbers.len() + 1;
+        numbers.entry(id).or_insert(next);
+    }
+    numbers
+}
+
+/// Embedded image assets referenced inside `block`, in reading order.
+fn block_image_assets(block: &Block) -> Vec<AssetId> {
+    let mut ids = Vec::new();
+    collect_block_assets(block, &mut ids);
+    ids
+}
+
+fn collect_block_assets(block: &Block, out: &mut Vec<AssetId>) {
+    fn walk_inlines(inlines: &[Inline], out: &mut Vec<AssetId>) {
+        for inline in inlines {
+            match inline {
+                Inline::Image {
+                    source: ImageSource::Asset(id),
+                    ..
+                } => out.push(*id),
+                Inline::Link { content, .. } => walk_inlines(content, out),
+                _ => {}
+            }
+        }
+    }
+    fn walk_blocks(blocks: &[Block], out: &mut Vec<AssetId>) {
+        for block in blocks {
+            collect_block_assets(block, out);
+        }
+    }
+    match block {
+        Block::Paragraph(inlines)
+        | Block::Heading {
+            content: inlines, ..
+        } => walk_inlines(inlines, out),
+        Block::List(list) => {
+            for item in &list.items {
+                walk_blocks(&item.blocks, out);
+            }
+        }
+        Block::Table(table) => {
+            for row in &table.grid {
+                for slot in row {
+                    if let CellSlot::Origin(cell) = slot {
+                        walk_blocks(&cell.blocks, out);
+                    }
+                }
+            }
+        }
+        Block::BlockQuote(blocks) => walk_blocks(blocks, out),
+        Block::CodeBlock { .. } | Block::Rule | Block::Math(_) => {}
+    }
 }
 
 fn render_block(block: &Block, rc: &Ctx) -> Option<String> {

@@ -16,8 +16,8 @@ use serde_json::{Map, Value};
 use crate::ConvertError;
 use crate::Format;
 use crate::ocr::{
-    ImageOcrConfig, OcrImage, OcrOptions, OcrOutcome, OcrProvider, OcrRequest, compose_alt,
-    content_hash, ensure_image_extension, run_image_ocr,
+    ImageOcrConfig, OcrImage, OcrOptions, OcrOutcome, OcrProvider, OcrRequest, content_hash,
+    ensure_image_extension, ocr_annotation, run_image_ocr,
 };
 use crate::render::markdown::document_to_markdown_with_ocr;
 
@@ -51,9 +51,10 @@ pub struct ConvertOptions {
     pub max_input_bytes: Option<u64>,
     /// Per-call override of the path sandbox roots.
     pub allowed_roots: Vec<PathBuf>,
-    /// OCR the images embedded in documents (docx/pdf/…), rendering them as
-    /// `![图片，OCR识别文字是：…](?)`. Defaults to true; a no-op without a
-    /// configured provider.
+    /// OCR the images embedded in documents (docx/pdf/…): each image keeps its
+    /// `![图片N](…)` marker and the recognized text follows it as a quoted
+    /// annotation block. Defaults to true; a no-op without a configured
+    /// provider.
     pub image_ocr: Option<bool>,
     /// Long-side cap (px) for images sent to OCR; larger ones are downscaled
     /// proportionally first. Defaults to 1024.
@@ -544,8 +545,9 @@ impl FileParser {
                     reason: "pdf-inspector text layer".into(),
                     confidence: None,
                 });
-                // OCR the extracted figures and fold the text into their
-                // `![图片N](name)` markers before the asset renaming below.
+                // OCR the extracted figures and append each result as an
+                // annotation block after its `![图片N](name)` marker, before
+                // the asset renaming below.
                 let mut markdown = output.markdown;
                 let targets: Vec<OcrImage> = output
                     .images
@@ -558,11 +560,8 @@ impl FileParser {
                 let outcomes =
                     run_image_ocr(&targets, &ocr.images, self.ocr.clone(), ocr.language).await;
                 for image in &output.images {
-                    let marker = format!(
-                        "![{}](?)",
-                        compose_alt("", outcomes.get(&content_hash(&image.data)))
-                    );
-                    markdown = replace_pdf_image_markers(&markdown, &image.name, &marker);
+                    let outcome = outcomes.get(&content_hash(&image.data));
+                    markdown = annotate_pdf_image_markers(&markdown, &image.name, outcome);
                 }
                 // Namespace the asset names by the document stem so several
                 // PDFs converted into one directory do not collide, and keep
@@ -735,28 +734,40 @@ fn safe_file_name(name: &str) -> Result<String, RuntimeError> {
     Ok(name.to_owned())
 }
 
-/// Replace every `![图片N](name)` marker — for any sequence number `N` —
-/// with `replacement`. pdf-engine numbers markers independently of the
-/// extracted asset names, so the match keys on the URL only.
-fn replace_pdf_image_markers(markdown: &str, name: &str, replacement: &str) -> String {
+/// Insert the OCR annotation for every `![图片N](name)` marker — for any
+/// sequence number `N` — right after the marker, leaving the marker itself
+/// intact so it keeps pointing at the extracted asset. `outcome` is the
+/// figure's OCR result; `None` (OCR pass disabled) inserts nothing.
+/// pdf-engine numbers markers independently of the extracted asset names, so
+/// the match keys on the URL only, and the marker's own number is reused as
+/// the annotation label.
+fn annotate_pdf_image_markers(markdown: &str, name: &str, outcome: Option<&OcrOutcome>) -> String {
     let needle = format!("]({name})");
     let marker_alt = "![图片";
     let mut out = String::with_capacity(markdown.len());
     let mut rest = markdown;
     while let Some(pos) = rest.find(&needle) {
         let before = &rest[..pos];
-        if let Some(start) = before.rfind(marker_alt) {
-            let digits = &before[start + marker_alt.len()..];
-            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-                out.push_str(&rest[..start]);
-                out.push_str(replacement);
+        let marker_number = before
+            .rfind(marker_alt)
+            .and_then(|start| before[start + marker_alt.len()..].parse::<usize>().ok());
+        match (marker_number, outcome) {
+            (Some(number), Some(outcome)) => {
+                out.push_str(&rest[..pos + needle.len()]);
+                // Blank lines on both sides keep the quoted block from
+                // absorbing (or being absorbed by) the neighbouring text.
+                let after = rest[pos + needle.len()..].trim_start_matches('\n');
+                out.push_str("\n\n");
+                out.push_str(&ocr_annotation(number, outcome));
+                out.push_str(if after.is_empty() { "\n" } else { "\n\n" });
+                rest = after;
+            }
+            _ => {
+                // Not an image marker, or nothing recognized here.
+                out.push_str(&rest[..pos + needle.len()]);
                 rest = &rest[pos + needle.len()..];
-                continue;
             }
         }
-        // Not an image marker; keep the occurrence intact.
-        out.push_str(&rest[..pos + needle.len()]);
-        rest = &rest[pos + needle.len()..];
     }
     out.push_str(rest);
     out
@@ -814,4 +825,38 @@ pub async fn convert_bytes(
         options,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_markers_keep_their_url_and_gain_an_annotation() {
+        let markdown = "Intro.\n\n![图片2](image-2)\n\nOutro.\n";
+        let annotated = annotate_pdf_image_markers(
+            markdown,
+            "image-2",
+            Some(&OcrOutcome::Text("line|with|pipes".into())),
+        );
+        assert_eq!(
+            annotated,
+            "Intro.\n\n![图片2](image-2)\n\n> 图片2的OCR解析结果如下：\n>\n> line|with|pipes\n\nOutro.\n"
+        );
+    }
+
+    #[test]
+    fn pdf_markers_without_an_outcome_are_untouched() {
+        let markdown = "![图片1](image-1)\n";
+        assert_eq!(
+            annotate_pdf_image_markers(markdown, "image-1", None),
+            markdown
+        );
+        // A same-named URL inside a link is not an image marker.
+        let linked = "[see](image-1)\n";
+        assert_eq!(
+            annotate_pdf_image_markers(linked, "image-1", Some(&OcrOutcome::Failed)),
+            linked
+        );
+    }
 }

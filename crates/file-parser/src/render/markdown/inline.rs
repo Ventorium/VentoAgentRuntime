@@ -220,16 +220,21 @@ fn render_image(alt: &str, source: &ImageSource, ctx: InlineContext, rc: &Ctx, o
             let _ = write!(out, "![{}]({})", alt, format_url(url));
         }
         // Embedded assets cannot be inlined as bytes, so the marker carries
-        // the signal instead: a fixed `图片` alt (plus OCR text when the
-        // image-OCR pass ran) tells readers an image exists here; the bytes
-        // stay available in `Document::assets`. `?` is a deliberate non-URL.
+        // the signal instead: a `图片N` alt (plus the document's own alt when
+        // it has one) tells readers an image exists here and how it is
+        // numbered; the bytes stay available in `Document::assets`. The
+        // destination is left empty rather than a placeholder like `?` — any
+        // non-empty target makes a renderer fetch the containing document
+        // itself, while an empty one issues no request at all. Recognized
+        // text is not part of the alt either: it is emitted as an annotation
+        // block after the referencing block.
         ImageSource::Asset(id) => {
-            let alt = compose_alt(alt, rc.asset_ocr.get(id));
-            let _ = write!(out, "![{alt}](?)");
+            let alt = compose_alt(alt, rc.asset_numbers.get(id).copied());
+            let _ = write!(out, "![{alt}]()");
         }
         ImageSource::Unavailable => {
             let alt = compose_alt(alt, None);
-            let _ = write!(out, "![{alt}](?)");
+            let _ = write!(out, "![{alt}]()");
         }
     }
 }
@@ -297,7 +302,7 @@ fn delims_of(run: &Norm, rc: &Ctx) -> Delims {
             ImageSource::External(_) => {}
             // Composed alts escape their brackets; only backticks can pair.
             ImageSource::Asset(id) => {
-                if compose_alt(alt, rc.asset_ocr.get(id)).contains('`') {
+                if compose_alt(alt, rc.asset_numbers.get(id).copied()).contains('`') {
                     delims.insert('`');
                 }
             }
